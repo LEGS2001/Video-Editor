@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Check lockfile
+        run: uv lock --check
+      - name: Install dependencies
+        run: uv sync --locked --extra test --extra dev
+      - name: Ruff
+        run: uv run --no-sync ruff check src tests
+      - name: Compile
+        run: uv run --no-sync python -m compileall -q src tests
+      - name: Unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: uv run --no-sync pytest -q -m "not ffmpeg"
+      - name: FFmpeg integration tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        shell: pwsh
+        run: |
+          if ((Get-Command ffmpeg -ErrorAction SilentlyContinue) -and (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+            uv run --no-sync pytest -q -m ffmpeg
+            $testExitCode = $LASTEXITCODE
+            if ($testExitCode -eq 5) { Write-Host "No FFmpeg integration tests collected."; exit 0 }
+            exit $testExitCode
+          } else {
+            Write-Host "Skipping FFmpeg integration tests: ffmpeg/ffprobe not found."
+          }
