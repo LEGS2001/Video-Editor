@@ -4,10 +4,11 @@ from video_editor.ffmpeg import (
     _atempo_filters,
     _concat_file_path,
     _concat_filter,
+    _drawtext_filters,
     build_ffmpeg_command,
     build_smart_render_commands,
 )
-from video_editor.models import Clip, Crop, ExportProfile, HardwareBackend, MediaAsset, RenderPlan, RenderRoute, Transform, VideoCodec
+from video_editor.models import Clip, Crop, ExportProfile, HardwareBackend, MediaAsset, RenderPlan, RenderRoute, TextOverlay, Transform, VideoCodec
 from video_editor.render_planner import RenderSegment
 
 
@@ -40,7 +41,7 @@ def test_builds_reencode_scale_command():
     assert "scale=1920:1080" in _vf_of(command)
     assert "libx264" in command.arguments
     assert "yuv420p" in command.arguments
-    assert command.arguments[command.arguments.index("-r") + 1] == "30"
+    assert command.arguments[command.arguments.index("-r") + 1] == "60"
 
 
 def _vf_of(command: FfmpegCommand) -> str:
@@ -161,7 +162,7 @@ def test_audio_only_concat_segment_gets_black_video():
 
     filter_complex = _concat_filter(RenderPlan(clips=[clip], assets=[asset]), ExportProfile(), include_audio=True)
 
-    assert "color=c=black:s=1920x1080:r=30:d=1.000" in filter_complex
+    assert "color=c=black:s=1920x1080:r=60:d=1.000" in filter_complex
 
 
 def test_smart_render_reuses_canonical_transform_chain():
@@ -256,3 +257,68 @@ def test_concat_uses_silence_at_four_x_and_effective_duration():
     assert "setpts=(PTS-STARTPTS)/4" in filter_complex
     assert "anullsrc=r=48000:cl=stereo,atrim=duration=1.000" in filter_complex
     assert "[0:a]atrim" not in filter_complex
+
+
+def _overlay(**kwargs) -> TextOverlay:
+    defaults = dict(text="Hello", start_ms=500, end_ms=2500, outline_px=3, x_px=100, y_px=800)
+    return TextOverlay(**{**defaults, **kwargs})
+
+
+def test_single_clip_burns_captions_into_the_video_filter():
+    asset = MediaAsset(id="a", path="/tmp/in.mp4", video_codec="h264", width=1920, height=1080, duration_ms=3000, has_video=True)
+    clip = Clip(asset_id=asset.id, source_out_ms=3000)
+    plan = _reencode_plan(asset, clip)
+    plan.texts = [_overlay()]
+
+    chain = _vf_of(build_ffmpeg_command(plan, ExportProfile(output_path="/tmp/out.mp4")))
+
+    assert "drawtext=" in chain
+    assert ":text=Hello:" in chain
+    assert ":fontsize=48:fontcolor=#ffffff:borderw=3:bordercolor=#000000:x=100:y=800" in chain
+    assert "enable='between(t,0.500,2.500)'" in chain
+
+
+def test_caption_survives_a_chain_that_would_otherwise_be_skipped():
+    """A clip needing no filters normally emits no -vf at all."""
+    asset = MediaAsset(id="a", path="/tmp/in.mp4", video_codec="h264", width=1920, height=1080, fps=60.0, duration_ms=3000, has_video=True)
+    clip = Clip(asset_id=asset.id, source_out_ms=3000)
+    profile = ExportProfile(output_path="/tmp/out.mp4")
+
+    assert "-vf" not in build_ffmpeg_command(_reencode_plan(asset, clip), profile).arguments
+
+    plan = _reencode_plan(asset, clip)
+    plan.texts = [_overlay()]
+    assert "drawtext=" in _vf_of(build_ffmpeg_command(plan, profile))
+
+
+def test_concat_draws_captions_once_after_the_join():
+    asset = MediaAsset(id="a", path="/tmp/in.mp4", video_codec="h264", width=1920, height=1080, duration_ms=4000, has_video=True)
+    clips = [Clip(asset_id=asset.id, source_out_ms=2000), Clip(asset_id=asset.id, source_in_ms=2000, source_out_ms=4000)]
+    plan = RenderPlan(clips=clips, assets=[asset, asset], texts=[_overlay()])
+
+    filter_complex = _concat_filter(plan, ExportProfile(), include_audio=False)
+
+    assert "concat=n=2:v=1:a=0[vsw]" in filter_complex
+    assert filter_complex.split(";")[-1].startswith("[vsw]drawtext=")
+    assert filter_complex.endswith("[v]")
+    assert filter_complex.count("drawtext=") == 1
+
+
+def test_captions_block_stream_copy():
+    asset = MediaAsset(id="a", path="/tmp/in.mp4", video_codec="h264", duration_ms=3000)
+    clip = Clip(asset_id=asset.id, source_out_ms=3000)
+    plan = RenderPlan(route=RenderRoute.STREAM_COPY, clip=clip, asset=asset, clips=[clip], assets=[asset], texts=[_overlay()])
+
+    command = build_ffmpeg_command(plan, ExportProfile(output_path="/tmp/out.mp4"))
+
+    assert "copy" not in command.arguments
+
+
+def test_drawtext_values_are_escaped():
+    """Escaping verified against ffmpeg by rendering text= and textfile= and
+    comparing pixels; ':' is special once, "'" at both parser levels, and '%'
+    must stay raw (expansion=none keeps it literal)."""
+    chain = ",".join(_drawtext_filters([_overlay(text="50%: it's [fine]")]))
+
+    assert r"text=50%\\: it\\\'s \\\[fine\\\]" in chain
+    assert ":expansion=none:" in chain

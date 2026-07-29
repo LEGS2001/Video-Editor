@@ -2,8 +2,14 @@ import json
 
 import pytest
 
-from video_editor.models import Clip, MediaAsset, Project
-from video_editor.project_io import load_project, project_from_dict, project_to_dict, save_project
+from video_editor.models import Clip, MediaAsset, Project, TextOverlay
+from video_editor.project_io import (
+    load_project,
+    project_from_dict,
+    project_to_dict,
+    save_project,
+    validate_project,
+)
 from video_editor.project_service import ProjectService
 
 
@@ -24,12 +30,14 @@ def test_project_json_round_trip_preserves_core_fields():
     )
     project.media.append(asset)
     project.timeline.tracks[0].clips.append(Clip(id="clip-1", asset_id=asset.id, source_out_ms=5000))
+    project.export_defaults.fps = 59.94
 
     loaded = project_from_dict(project_to_dict(project))
 
     assert loaded.name == "Demo"
     assert loaded.media[0].video_codec == "h264"
     assert loaded.timeline.tracks[0].clips[0].duration_ms == 5000
+    assert loaded.export_defaults.fps == 59.94
 
 
 def test_service_adds_clips_contiguously():
@@ -43,6 +51,24 @@ def test_service_adds_clips_contiguously():
     assert first.timeline_start_ms == 0
     assert second.timeline_start_ms == 1000
     assert service.timeline_duration_ms() == 3000
+
+
+def test_first_video_clip_uses_its_fps_and_codec_as_export_defaults():
+    service = ProjectService()
+    asset = MediaAsset(
+        id="source",
+        path="/tmp/source.mov",
+        video_codec="hevc",
+        fps=59.94,
+        duration_ms=1000,
+        has_video=True,
+    )
+    service.add_media(asset)
+
+    service.add_asset_to_timeline(asset.id)
+
+    assert service.project.export_defaults.fps == 59.94
+    assert service.project.export_defaults.codec.value == "h265"
 
 
 def test_service_finds_clip_at_timeline_and_next_clip():
@@ -129,6 +155,28 @@ def test_clip_speed_is_optional_in_json_v1_and_changes_timeline_duration():
     legacy = project_from_dict(payload).timeline.tracks[0].clips[0]
     assert legacy.speed == 1.0
     assert legacy.duration_ms == 4000
+
+
+def test_legacy_project_without_export_fps_uses_common_clip_fps():
+    asset = MediaAsset(
+        id="asset",
+        path="/tmp/a.mp4",
+        width=1920,
+        height=1080,
+        video_codec="hevc",
+        fps=59.94,
+        duration_ms=4000,
+        has_video=True,
+    )
+    project = Project(media=[asset])
+    project.timeline.tracks[0].clips.append(Clip(id="clip", asset_id=asset.id, source_out_ms=4000))
+    payload = project_to_dict(project)
+    del payload["project"]["exportDefaults"]["fps"]
+
+    loaded = project_from_dict(payload)
+
+    assert loaded.export_defaults.fps == 59.94
+    assert loaded.export_defaults.codec.value == "h265"
 
 
 def test_speed_is_undoable_redoable_and_a_new_edit_invalidates_redo():
@@ -218,3 +266,60 @@ def test_relink_batch_is_atomic_and_preserves_asset_ids():
     assert service.asset_by_id(first.id).path == "found-a.mp4"
     assert service.asset_by_id(first.id).id == first.id
     assert service.asset_by_id(second.id).id == second.id
+
+
+def test_text_overlays_round_trip_and_old_projects_load_without_them():
+    project = Project(name="Captions")
+    project.timeline.texts.append(
+        TextOverlay(
+            id="text-1", text="Hello: world", start_ms=500, end_ms=2500,
+            font="Impact", size_px=72, color="#ff0000", outline_color="#101010",
+            outline_px=4, x_px=120, y_px=880,
+        )
+    )
+
+    payload = project_to_dict(project)
+    loaded = project_from_dict(payload)
+
+    assert [text.text for text in loaded.timeline.texts] == ["Hello: world"]
+    overlay = loaded.timeline.texts[0]
+    assert (overlay.start_ms, overlay.end_ms) == (500, 2500)
+    assert (overlay.font, overlay.size_px, overlay.color) == ("Impact", 72, "#ff0000")
+    assert (overlay.outline_color, overlay.outline_px) == ("#101010", 4)
+    assert (overlay.x_px, overlay.y_px) == (120, 880)
+
+    # Projects saved before captions existed have no "texts" key at all.
+    del payload["project"]["timeline"]["texts"]
+    assert project_from_dict(payload).timeline.texts == []
+
+
+def test_invalid_text_overlay_is_rejected():
+    project = Project()
+    project.timeline.texts.append(TextOverlay(id="t", start_ms=1000, end_ms=1000))
+    with pytest.raises(ValueError, match="timing"):
+        validate_project(project)
+
+    project.timeline.texts[0].end_ms = 2000
+    project.timeline.texts[0].color = "red"
+    with pytest.raises(ValueError, match="colour"):
+        validate_project(project)
+
+
+def test_service_text_edits_are_undoable():
+    service = ProjectService()
+    overlay = service.add_text(1000, 4000)
+
+    assert service.set_text_range(overlay.id, 2000, 5000)
+    assert (overlay.start_ms, overlay.end_ms) == (2000, 5000)
+    assert not service.set_text_range(overlay.id, 5000, 5000)
+
+    assert service.update_text(overlay.id, text="Hi", size_px=60)
+    assert not service.update_text(overlay.id, text="Hi", size_px=60)
+
+    service.undo()
+    assert service.texts[0].text == "Caption"
+    service.undo()
+    assert (service.texts[0].start_ms, service.texts[0].end_ms) == (1000, 4000)
+
+    assert service.remove_text(service.texts[0].id)
+    assert service.texts == []

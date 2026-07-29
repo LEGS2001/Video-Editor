@@ -19,9 +19,6 @@ class HardwareCapabilities:
     has_qsv: bool = False
     vaapi_device: str = "/dev/dri/renderD128"
 
-    def supports_encoder(self, encoder: str) -> bool:
-        return encoder in self.encoders
-
     def supports(self, backend: HardwareBackend, codec: VideoCodec = VideoCodec.H264) -> bool:
         """Return whether the requested backend/codec pair is usable.
 
@@ -37,7 +34,7 @@ class HardwareCapabilities:
             HardwareBackend.QSV: self.has_qsv,
             HardwareBackend.CPU: True,
         }[backend]
-        return runtime_available and self.supports_encoder(encoder_for(codec, backend))
+        return runtime_available and encoder_for(codec, backend) in self.encoders
 
 
 _AUTO_BACKEND_ORDER = (
@@ -49,12 +46,9 @@ _AUTO_BACKEND_ORDER = (
 
 
 def _first_vaapi_render_device(dev_dri: Path = Path("/dev/dri")) -> str:
-    if not sys.platform.startswith("linux"):
+    if not sys.platform.startswith("linux") or not dev_dri.exists():
         return ""
-    dri = dev_dri
-    if not dri.exists():
-        return ""
-    devices = sorted(dri.glob("renderD*"))
+    devices = sorted(dev_dri.glob("renderD*"))
     return str(devices[0]) if devices else ""
 
 
@@ -150,23 +144,15 @@ def supported_backends_for_platform() -> list[HardwareBackend]:
     return backends
 
 
-def _backend_available(
-    capabilities: HardwareCapabilities,
-    backend: HardwareBackend,
-    codec: VideoCodec = VideoCodec.H264,
-) -> bool:
-    return capabilities.supports(backend, codec)
-
-
 def choose_backend(
     capabilities: HardwareCapabilities,
     requested: HardwareBackend,
     codec: VideoCodec = VideoCodec.H264,
 ) -> HardwareBackend:
     if requested != HardwareBackend.AUTO:
-        return requested if _backend_available(capabilities, requested, codec) else HardwareBackend.CPU
+        return requested if capabilities.supports(requested, codec) else HardwareBackend.CPU
     return next(
-        (backend for backend in _AUTO_BACKEND_ORDER if _backend_available(capabilities, backend, codec)),
+        (backend for backend in _AUTO_BACKEND_ORDER if capabilities.supports(backend, codec)),
         HardwareBackend.CPU,
     )
 
@@ -181,12 +167,3 @@ def encoder_for(codec: VideoCodec, backend: HardwareBackend) -> str:
         HardwareBackend.AUTO: {VideoCodec.H264: "libx264", VideoCodec.H265: "libx265", VideoCodec.AV1: "libsvtav1"},
     }
     return table[backend][codec]
-
-
-class HardwareDetector:
-    detect = staticmethod(detect_hardware)
-    choose_backend = staticmethod(choose_backend)
-    encoder_for = staticmethod(encoder_for)
-    supported_backends_for_platform = staticmethod(supported_backends_for_platform)
-    first_vaapi_render_device = staticmethod(_first_vaapi_render_device)
-    has_nvidia_runtime = staticmethod(_has_nvidia_runtime)

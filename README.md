@@ -20,12 +20,16 @@ Python/PySide6 video editor focused on fast FFmpeg exports. The app keeps the re
 - Split the active clip at the playhead.
 - Trim clips with playhead-based In/Out buttons or one-second nudges.
 - Change video speed from `0.25x` to `100x`; audio keeps its pitch below `4x` and is silent from `4x`.
+- Choose the export frame rate from `1` to `240` FPS; new projects default to `60` FPS and adopt the first video clip's FPS.
 - Undo and Redo up to 30 project states.
 - Autosave atomic recovery snapshots and restore newer work after an unexpected close.
 - Keep projects open when media is offline, then relink one file or a whole folder.
+- Add caption text with a chosen font, size, fill colour, and outline; drag its bar in the timeline's text row to retime it and drag the caption itself in the preview to position it. Captions are burned in on export and force a reencode.
+- Play and pause the preview with `Space`.
 - Navigate by frame with `,` and `.`, jump with `Home`/`End`, and toggle timeline snapping with `N`.
 - Reset timeline-level properties or the selected clip's editable properties from the top toolbar; both operations support Undo.
-- Export through FFmpeg with stream-copy when possible.
+- Export untouched compatible clips through FFmpeg stream copy, including compatible container remuxes.
+- Smart-render mixed timelines by copying untouched clips and reencoding only changed clips when their streams can be concatenated safely.
 
 ## Project Layout
 
@@ -97,4 +101,4 @@ Tests marked `ffmpeg` are integration tests. CI runs them only when both
 - Crop, scale, position, opacity, rotation, resolution changes, FPS changes, or incompatible media force reencode.
 - Any clip whose speed differs from `1x` is reencoded; untouched smart-render segments may still be copied.
 - Auto backend prefers VAAPI, then NVENC, AMF, QSV, and finally CPU.
-- Project files remain JSON version `1`; older files without `speed` load at `1x`.
+- Project files remain JSON version `1`; older files without `speed` load at `1x` and files without `texts` load with no captions.

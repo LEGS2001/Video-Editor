@@ -100,6 +100,29 @@ class Clip:
 
 
 @dataclass
+class TextOverlay:
+    """A caption burned onto the whole timeline between start_ms and end_ms.
+    Position is the text's top-left corner in canvas pixels, which is what both
+    the preview item and the ffmpeg drawtext filter anchor on."""
+
+    id: str = field(default_factory=lambda: uuid4().hex)
+    text: str = "Caption"
+    start_ms: int = 0
+    end_ms: int = 3000
+    font: str = "Arial"
+    size_px: int = 48
+    color: str = "#ffffff"
+    outline_color: str = "#000000"
+    outline_px: int = 3
+    x_px: int = 0
+    y_px: int = 0
+
+    @property
+    def duration_ms(self) -> int:
+        return max(0, self.end_ms - self.start_ms)
+
+
+@dataclass
 class Track:
     id: str = field(default_factory=lambda: uuid4().hex)
     type: TrackType = TrackType.VIDEO
@@ -115,6 +138,7 @@ class Timeline:
     fps: float = 30.0
     master_volume: float = 1.0
     tracks: list[Track] = field(default_factory=lambda: [Track()])
+    texts: list[TextOverlay] = field(default_factory=list)
 
 
 @dataclass
@@ -139,6 +163,7 @@ class MediaAsset:
 class ExportDefaults:
     codec: VideoCodec = VideoCodec.H264
     hardware_backend: HardwareBackend = HardwareBackend.AUTO
+    fps: float = 60.0
     bitrate_kbps: int = 12000
     audio_bitrate_kbps: int = 192
     prefer_speed_over_quality: bool = True
@@ -152,16 +177,12 @@ class ExportProfile:
     hardware_backend: HardwareBackend = HardwareBackend.AUTO
     width: int = 1920
     height: int = 1080
-    fps: float = 30.0
+    fps: float = 60.0
     bitrate_kbps: int = 12000
     audio_bitrate_kbps: int = 192
     prefer_speed_over_quality: bool = True
     allow_stream_copy: bool = True
     master_volume: float = 1.0
-
-    @property
-    def has_master_gain(self) -> bool:
-        return abs(self.master_volume - 1.0) > 1e-6
 
 
 @dataclass
@@ -182,3 +203,4 @@ class RenderPlan:
     asset: MediaAsset = field(default_factory=MediaAsset)
     clips: list[Clip] = field(default_factory=list)
     assets: list[MediaAsset] = field(default_factory=list)
+    texts: list[TextOverlay] = field(default_factory=list)

@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import os
 import shlex
-import subprocess
 import tempfile
 from math import ceil, cos, radians, sin
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 from .hardware import HardwareCapabilities, detect_hardware_cached, encoder_for
 from .models import ExportProfile, HardwareBackend, RenderPlan, RenderRoute, VideoCodec
@@ -29,10 +27,7 @@ class FfmpegCommand:
 
     def cleanup(self) -> None:
         for path in self.temporary_files:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
+            Path(path).unlink(missing_ok=True)
 
 
 def _concat_file_path(path: str) -> str:
@@ -128,6 +123,70 @@ def _clip_software_filters(clip, asset, profile: ExportProfile) -> list[str]:
     return filters
 
 
+FONT_FILES = {
+    "Arial": "arial.ttf",
+    "Arial Bold": "arialbd.ttf",
+    "Impact": "impact.ttf",
+    "Segoe UI": "segoeui.ttf",
+    "Verdana": "verdana.ttf",
+    "Times New Roman": "times.ttf",
+    "Courier New": "cour.ttf",
+    "Comic Sans MS": "comic.ttf",
+}
+
+
+def _escape_drawtext(value: str) -> str:
+    """Escape a value for a drawtext option.
+
+    FFmpeg unescapes filter option values twice: once splitting the graph on
+    , ; [ ] ' and once splitting a filter's arguments on ':'. A character that
+    is special at both levels therefore needs escaping twice. Verified against
+    ffmpeg by rendering text= and comparing it pixel-for-pixel with the
+    equivalent textfile=, which needs no escaping at all.
+
+    '%' is deliberately NOT escaped: '\\%' makes drawtext render nothing. The
+    caption is kept literal with expansion=none instead.
+    """
+    out = value.replace("\\", "\\\\\\\\")
+    out = out.replace(":", "\\\\:")
+    for char in "',;[]":
+        out = out.replace(char, "\\\\\\" + char)
+    return out.replace("\n", " ")
+
+
+def _font_argument(name: str) -> str:
+    """Prefer an explicit font file — Windows FFmpeg builds often lack the
+    fontconfig lookup that `font=` needs. Falls back to the family name."""
+    fonts_dir = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+    path = fonts_dir / FONT_FILES.get(name, "")
+    if FONT_FILES.get(name) and path.is_file():
+        return "fontfile=" + _escape_drawtext(path.as_posix())
+    return f"font={_escape_drawtext(name)}"
+
+
+def visible_texts(texts) -> list:
+    return [text for text in texts if text.text.strip() and text.end_ms > text.start_ms]
+
+
+def _drawtext_filters(texts) -> list[str]:
+    """One drawtext per overlay, gated to its timeline window. Timeline ms map
+    straight onto output seconds because the timeline is packed from zero."""
+    filters = []
+    for text in visible_texts(texts):
+        filters.append(
+            f"drawtext={_font_argument(text.font)}"
+            f":text={_escape_drawtext(text.text)}"
+            f":expansion=none"
+            f":fontsize={max(1, int(text.size_px))}"
+            f":fontcolor={text.color}"
+            f":borderw={max(0, int(text.outline_px))}"
+            f":bordercolor={text.outline_color}"
+            f":x={int(text.x_px)}:y={int(text.y_px)}"
+            f":enable='between(t,{text.start_ms / 1000.0:.3f},{text.end_ms / 1000.0:.3f})'"
+        )
+    return filters
+
+
 def _atempo_filters(speed: float) -> list[str]:
     """Decompose a rate into FFmpeg's supported 0.5..2.0 atempo range."""
     filters: list[str] = []
@@ -156,16 +215,15 @@ def _audio_filters(clip, profile: ExportProfile) -> list[str]:
 def _video_filter(plan: RenderPlan, profile: ExportProfile) -> str:
     clip, asset = plan.clip, plan.asset
     filters = _clip_software_filters(clip, asset, profile)
+    text_filters = _drawtext_filters(plan.texts)
+    # Captions are drawn in software, so they must go in before the VAAPI upload.
+    filters.extend(text_filters)
     if plan.backend == HardwareBackend.VAAPI:
         filters.extend(["format=nv12", "hwupload"])
         return ",".join(filters)
-    only_normalization = filters == [f"fps={profile.fps:g}", "setsar=1"]
+    only_normalization = not text_filters and filters == [f"fps={profile.fps:g}", "setsar=1"]
     source_fps_matches = asset.fps <= 0 or abs(asset.fps - profile.fps) <= 0.01
     return "" if only_normalization and source_fps_matches else ",".join(filters)
-
-
-def _can_concat_audio(plan: RenderPlan) -> bool:
-    return any(asset.has_audio for asset in plan.assets)
 
 
 def _concat_filter(plan: RenderPlan, profile: ExportProfile, include_audio: bool) -> str:
@@ -209,17 +267,20 @@ def _concat_filter(plan: RenderPlan, profile: ExportProfile, include_audio: bool
             concat_inputs.append(f"[a{index}]")
 
     audio_label = "[a]" if include_audio else ""
-    if plan.backend == HardwareBackend.VAAPI:
-        # The concat runs in software; upload the joined stream so the VAAPI
-        # encoder receives hardware frames.
-        filters.append(f"{''.join(concat_inputs)}concat=n={len(plan.clips)}:v=1:a={1 if include_audio else 0}[vsw]{audio_label}")
-        filters.append("[vsw]format=nv12,hwupload[v]")
+    text_filters = _drawtext_filters(plan.texts)
+    # Captions span the whole timeline, so they are drawn once on the joined
+    # stream — and before any VAAPI upload, since drawtext runs in software.
+    software_tail = ",".join(text_filters + ["format=nv12", "hwupload"]) if plan.backend == HardwareBackend.VAAPI else ",".join(text_filters)
+    concat = f"{''.join(concat_inputs)}concat=n={len(plan.clips)}:v=1:a={1 if include_audio else 0}"
+    if software_tail:
+        filters.append(f"{concat}[vsw]{audio_label}")
+        filters.append(f"[vsw]{software_tail}[v]")
     else:
-        filters.append(f"{''.join(concat_inputs)}concat=n={len(plan.clips)}:v=1:a={1 if include_audio else 0}[v]{audio_label}")
+        filters.append(f"{concat}[v]{audio_label}")
     return ";".join(filters)
 
 
-def _append_concat_demuxer_input(command: FfmpegCommand, plan: RenderPlan) -> bool:
+def _append_concat_demuxer_input(command: FfmpegCommand, plan: RenderPlan) -> None:
     concat_file = tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="video-editor-concat-", suffix=".txt", delete=False)
     with concat_file:
         for clip, asset in zip(plan.clips, plan.assets, strict=True):
@@ -230,7 +291,6 @@ def _append_concat_demuxer_input(command: FfmpegCommand, plan: RenderPlan) -> bo
                 concat_file.write(f"outpoint {clip.source_out_ms / 1000.0:.3f}\n")
     command.temporary_files.append(concat_file.name)
     command.arguments.extend(["-f", "concat", "-safe", "0", "-i", concat_file.name])
-    return True
 
 
 def _append_encoder_args(command: FfmpegCommand, plan: RenderPlan, profile: ExportProfile) -> None:
@@ -248,6 +308,8 @@ def _append_encoder_args(command: FfmpegCommand, plan: RenderPlan, profile: Expo
 
 
 def _known_stream_copy_conflict(plan: RenderPlan, profile: ExportProfile) -> bool:
+    if visible_texts(plan.texts):
+        return True
     output_container = _output_container(profile.output_path)
     if output_container and not _video_compatible(profile.codec, output_container):
         return True
@@ -317,7 +379,7 @@ def build_ffmpeg_command(
     if route == RenderRoute.STREAM_COPY:
         command.arguments.extend(["-c", "copy"])
     elif multi_clip:
-        include_audio = _can_concat_audio(plan)
+        include_audio = any(asset.has_audio for asset in plan.assets)
         command.arguments.extend(["-filter_complex", _concat_filter(plan, profile, include_audio), "-map", "[v]"])
         if include_audio:
             command.arguments.extend(["-map", "[a]"])
@@ -336,10 +398,11 @@ def build_ffmpeg_command(
         command.arguments.extend(["-c:a", "aac", "-b:a", f"{profile.audio_bitrate_kbps}k"])
     else:
         duration = max(0.001, plan.clip.duration_ms / 1000.0)
-        color = (
-            f"color=c=black:s={profile.width}x{profile.height}:r={profile.fps:g}:"
-            f"d={duration:.3f},setsar=1[v]"
-        )
+        color = ",".join([
+            f"color=c=black:s={profile.width}x{profile.height}:r={profile.fps:g}:d={duration:.3f}",
+            "setsar=1",
+            *_drawtext_filters(plan.texts),
+        ]) + "[v]"
         command.arguments.extend(["-filter_complex", color, "-map", "[v]", "-map", "0:a:0?"])
         _append_encoder_args(command, plan, profile)
         audio_filters = _audio_filters(plan.clip, profile)
@@ -414,10 +477,11 @@ def build_smart_render_commands(segments, profile: ExportProfile) -> list[tuple[
         )
         handle.close()
         ts_paths.append(handle.name)
-        if segment.encode:
-            command = _segment_encode_command(segment.clip, segment.asset, profile, handle.name)
-        else:
-            command = _segment_copy_command(segment.asset, handle.name)
+        command = (
+            _segment_encode_command(segment.clip, segment.asset, profile, handle.name)
+            if segment.encode
+            else _segment_copy_command(segment.asset, handle.name)
+        )
         jobs.append((command, max(1, segment.clip.duration_ms)))
 
     list_handle = tempfile.NamedTemporaryFile(
@@ -440,131 +504,3 @@ def build_smart_render_commands(segments, profile: ExportProfile) -> list[tuple[
     total = sum(weight for _, weight in jobs) or 1
     jobs.append((concat, total))
     return jobs
-
-
-class FfmpegCommandBuilder:
-    build = staticmethod(build_ffmpeg_command)
-    video_filter = staticmethod(_video_filter)
-    can_concat_audio = staticmethod(_can_concat_audio)
-    concat_filter = staticmethod(_concat_filter)
-    append_concat_demuxer_input = staticmethod(_append_concat_demuxer_input)
-    append_encoder_args = staticmethod(_append_encoder_args)
-
-
-ProgressCallback = Callable[[float, str], None]
-
-
-def run_ffmpeg(command: FfmpegCommand, total_duration_ms: int, progress: ProgressCallback | None = None) -> int:
-    process = subprocess.Popen(command.argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    assert process.stdout is not None
-    try:
-        for line in process.stdout:
-            if progress is None:
-                continue
-            stripped = line.strip()
-            if stripped.startswith("out_time_ms=") and total_duration_ms > 0:
-                try:
-                    out_time_ms = int(stripped.split("=", 1)[1]) // 1000
-                    progress(min(1.0, out_time_ms / total_duration_ms), stripped)
-                except ValueError:
-                    progress(0.0, stripped)
-            else:
-                progress(0.0, stripped)
-        return process.wait()
-    finally:
-        command.cleanup()
-
-
-class FfmpegExecutor:
-    def __init__(
-        self,
-        *,
-        on_progress: Callable[[float], None] | None = None,
-        on_log: Callable[[str], None] | None = None,
-    ) -> None:
-        self.on_progress = on_progress
-        self.on_log = on_log
-        self.process: subprocess.Popen[str] | None = None
-        self.last_out_time_ms = 0
-        self.total_duration_ms = 0
-        self.temporary_files: list[str] = []
-
-    def start(self, command: FfmpegCommand, total_duration_ms: int = 0) -> bool:
-        if self.is_running():
-            return False
-        self.total_duration_ms = total_duration_ms
-        self.temporary_files = list(command.temporary_files)
-        self._log(command.to_shell_string())
-        try:
-            self.process = subprocess.Popen(
-                command.argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except OSError:
-            self.cleanup_temporary_files()
-            self.process = None
-            return False
-        return True
-
-    def run(self, command: FfmpegCommand, total_duration_ms: int = 0) -> subprocess.CompletedProcess[str]:
-        self.total_duration_ms = total_duration_ms
-        self.temporary_files = list(command.temporary_files)
-        self._log(command.to_shell_string())
-        try:
-            completed = subprocess.run(command.argv, capture_output=True, text=True, check=False)
-            self.process_progress_lines(completed.stdout.splitlines())
-            self.process_log_lines(completed.stderr.splitlines())
-            self._progress(1.0 if completed.returncode == 0 else 0.0)
-            return completed
-        finally:
-            self.cleanup_temporary_files()
-
-    def cancel(self) -> None:
-        if not self.is_running() or self.process is None:
-            return
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait()
-        self.cleanup_temporary_files()
-
-    def is_running(self) -> bool:
-        return bool(self.process and self.process.poll() is None)
-
-    def process_progress_lines(self, lines) -> None:
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            self._log(stripped)
-            if stripped.startswith("out_time_ms="):
-                self.last_out_time_ms = int(stripped.split("=", 1)[1]) // 1000
-                if self.total_duration_ms > 0:
-                    progress = self.last_out_time_ms / self.total_duration_ms
-                    self._progress(min(max(progress, 0.0), 0.99))
-
-    def process_log_lines(self, lines) -> None:
-        for line in lines:
-            stripped = line.strip()
-            if stripped:
-                self._log(stripped)
-
-    def cleanup_temporary_files(self) -> None:
-        for path in self.temporary_files:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-        self.temporary_files.clear()
-
-    def _log(self, line: str) -> None:
-        if self.on_log:
-            self.on_log(line)
-
-    def _progress(self, progress: float) -> None:
-        if self.on_progress:
-            self.on_progress(progress)

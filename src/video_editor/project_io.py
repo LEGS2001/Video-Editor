@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
@@ -15,6 +16,7 @@ from .models import (
     HardwareBackend,
     MediaAsset,
     Project,
+    TextOverlay,
     Timeline,
     Track,
     TrackType,
@@ -22,9 +24,7 @@ from .models import (
     VideoCodec,
 )
 
-
-def hardware_backend_to_string(backend: HardwareBackend) -> str:
-    return backend.value
+_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 def hardware_backend_from_string(value: str) -> HardwareBackend:
@@ -34,23 +34,21 @@ def hardware_backend_from_string(value: str) -> HardwareBackend:
         return HardwareBackend.AUTO
 
 
-def video_codec_to_string(codec: VideoCodec) -> str:
-    return codec.value
-
-
 def video_codec_from_string(value: str) -> VideoCodec:
-    normalized = (value or "").lower()
-    if normalized in {"h265", "hevc"}:
-        return VideoCodec.H265
-    if normalized == "av1":
-        return VideoCodec.AV1
-    return VideoCodec.H264
+    return {
+        "avc": VideoCodec.H264,
+        "avc1": VideoCodec.H264,
+        "h265": VideoCodec.H265,
+        "hevc": VideoCodec.H265,
+        "hev1": VideoCodec.H265,
+        "hvc1": VideoCodec.H265,
+        "av1": VideoCodec.AV1,
+        "av01": VideoCodec.AV1,
+    }.get((value or "").lower(), VideoCodec.H264)
 
 
 def _int64(value: Any) -> int:
-    if value is None:
-        return 0
-    return int(value)
+    return 0 if value is None else int(value)
 
 
 def _clip_to_dict(clip: Clip) -> dict[str, Any]:
@@ -104,6 +102,38 @@ def _clip_from_dict(data: dict[str, Any]) -> Clip:
         muted=bool(data.get("muted", False)),
         group_id=data.get("groupId", ""),
         speed=float(data.get("speed", 1.0)),
+    )
+
+
+def _text_to_dict(text: TextOverlay) -> dict[str, Any]:
+    return {
+        "id": text.id,
+        "text": text.text,
+        "startMs": str(text.start_ms),
+        "endMs": str(text.end_ms),
+        "font": text.font,
+        "sizePx": text.size_px,
+        "color": text.color,
+        "outlineColor": text.outline_color,
+        "outlinePx": text.outline_px,
+        "xPx": text.x_px,
+        "yPx": text.y_px,
+    }
+
+
+def _text_from_dict(data: dict[str, Any]) -> TextOverlay:
+    return TextOverlay(
+        id=data.get("id", ""),
+        text=data.get("text", ""),
+        start_ms=_int64(data.get("startMs")),
+        end_ms=_int64(data.get("endMs")),
+        font=data.get("font", "Arial"),
+        size_px=int(data.get("sizePx", 48)),
+        color=data.get("color", "#ffffff"),
+        outline_color=data.get("outlineColor", "#000000"),
+        outline_px=int(data.get("outlinePx", 3)),
+        x_px=int(data.get("xPx", 0)),
+        y_px=int(data.get("yPx", 0)),
     )
 
 
@@ -166,10 +196,12 @@ def project_to_dict(project: Project) -> dict[str, Any]:
                     }
                     for track in project.timeline.tracks
                 ],
+                "texts": [_text_to_dict(text) for text in project.timeline.texts],
             },
             "exportDefaults": {
                 "codec": project.export_defaults.codec.value,
                 "hardwareBackend": project.export_defaults.hardware_backend.value,
+                "fps": project.export_defaults.fps,
                 "bitrateKbps": project.export_defaults.bitrate_kbps,
                 "audioBitrateKbps": project.export_defaults.audio_bitrate_kbps,
                 "preferSpeedOverQuality": project.export_defaults.prefer_speed_over_quality,
@@ -186,17 +218,16 @@ def project_from_dict(root: dict[str, Any]) -> Project:
 
     data = root.get("project") or {}
     timeline_data = data.get("timeline") or {}
-    tracks = []
-    for track_data in timeline_data.get("tracks", []):
-        tracks.append(
-            Track(
-                id=track_data.get("id", ""),
-                type=TrackType.AUDIO if track_data.get("type") == "audio" else TrackType.VIDEO,
-                muted=bool(track_data.get("muted", False)),
-                locked=bool(track_data.get("locked", False)),
-                clips=[_clip_from_dict(item) for item in track_data.get("clips", [])],
-            )
+    tracks = [
+        Track(
+            id=track_data.get("id", ""),
+            type=TrackType.AUDIO if track_data.get("type") == "audio" else TrackType.VIDEO,
+            muted=bool(track_data.get("muted", False)),
+            locked=bool(track_data.get("locked", False)),
+            clips=[_clip_from_dict(item) for item in track_data.get("clips", [])],
         )
+        for track_data in timeline_data.get("tracks", [])
+    ]
 
     defaults = data.get("exportDefaults") or {}
     project = Project(
@@ -208,12 +239,14 @@ def project_from_dict(root: dict[str, Any]) -> Project:
             fps=float(timeline_data.get("fps", 30.0)),
             master_volume=float(timeline_data.get("masterVolume", 1.0)),
             tracks=tracks or [Track()],
+            texts=[_text_from_dict(item) for item in timeline_data.get("texts", [])],
         ),
         export_defaults=ExportDefaults(
             codec=video_codec_from_string(defaults.get("codec", VideoCodec.H264.value)),
             hardware_backend=hardware_backend_from_string(
                 defaults.get("hardwareBackend", HardwareBackend.AUTO.value)
             ),
+            fps=float(defaults.get("fps", 60.0)),
             bitrate_kbps=int(defaults.get("bitrateKbps", 12000)),
             audio_bitrate_kbps=int(defaults.get("audioBitrateKbps", 192)),
             prefer_speed_over_quality=bool(defaults.get("preferSpeedOverQuality", True)),
@@ -221,6 +254,22 @@ def project_from_dict(root: dict[str, Any]) -> Project:
         ),
         media=[_asset_from_dict(item) for item in data.get("media", [])],
     )
+    if "fps" not in defaults:
+        clip_asset_ids = {
+            clip.asset_id
+            for track in project.timeline.tracks
+            if track.type == TrackType.VIDEO
+            for clip in track.clips
+        }
+        source_assets = [
+            asset for asset in project.media if asset.id in clip_asset_ids and asset.has_video
+        ]
+        source_fps = [asset.fps for asset in source_assets if asset.fps > 0]
+        if source_fps and all(abs(fps - source_fps[0]) <= 0.01 for fps in source_fps[1:]):
+            project.export_defaults.fps = source_fps[0]
+        source_codecs = {asset.video_codec.lower() for asset in source_assets if asset.video_codec}
+        if len(source_codecs) == 1:
+            project.export_defaults.codec = video_codec_from_string(source_codecs.pop())
     for track in project.timeline.tracks:
         for clip in track.clips:
             clip.set_timeline_fps(project.timeline.fps)
@@ -297,7 +346,21 @@ def validate_project(project: Project) -> None:
             if not 0.25 <= clip.speed <= 100.0:
                 raise ValueError(f"Clip {clip.id!r} speed must be between 0.25 and 100")
 
+    text_ids: set[str] = set()
+    for text in timeline.texts:
+        if not text.id or text.id in text_ids:
+            raise ValueError(f"Text overlay id is missing or duplicated: {text.id!r}")
+        text_ids.add(text.id)
+        if text.start_ms < 0 or text.end_ms <= text.start_ms:
+            raise ValueError(f"Text overlay {text.id!r} has invalid timing")
+        if text.size_px <= 0 or text.outline_px < 0:
+            raise ValueError(f"Text overlay {text.id!r} has invalid size or outline width")
+        if not _HEX_COLOR.match(text.color) or not _HEX_COLOR.match(text.outline_color):
+            raise ValueError(f"Text overlay {text.id!r} has an invalid colour")
+
     defaults = project.export_defaults
+    if not math.isfinite(defaults.fps) or defaults.fps <= 0:
+        raise ValueError("Export FPS must be positive")
     if defaults.bitrate_kbps <= 0 or defaults.audio_bitrate_kbps <= 0:
         raise ValueError("Export bitrates must be positive")
 
@@ -324,21 +387,3 @@ def save_project(project: Project, path: str | Path) -> None:
 
 def load_project(path: str | Path) -> Project:
     return project_from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
-
-
-class ProjectJson:
-    @staticmethod
-    def to_json(project: Project) -> dict[str, Any]:
-        return project_to_dict(project)
-
-    @staticmethod
-    def from_json(root: dict[str, Any]) -> Project:
-        return project_from_dict(root)
-
-    @staticmethod
-    def save_file(project: Project, path: str | Path) -> None:
-        save_project(project, path)
-
-    @staticmethod
-    def load_file(path: str | Path) -> Project:
-        return load_project(path)

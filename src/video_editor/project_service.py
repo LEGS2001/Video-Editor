@@ -4,7 +4,18 @@ from bisect import bisect_right
 from copy import deepcopy
 from uuid import uuid4
 
-from .models import Clip, Crop, MediaAsset, Project, Timeline, Track, TrackType, Transform
+from .models import (
+    Clip,
+    Crop,
+    MediaAsset,
+    Project,
+    TextOverlay,
+    Timeline,
+    Track,
+    TrackType,
+    Transform,
+    VideoCodec,
+)
 
 
 class ProjectService:
@@ -68,6 +79,20 @@ class ProjectService:
             raise ValueError("Media asset not found")
         self.snapshot()
         track = self._ensure_video_track()
+        has_video = any(
+            clip.asset_id in self._asset_index and self._asset_index[clip.asset_id].has_video
+            for clip in track.clips
+        )
+        if asset.has_video and not has_video:
+            if asset.fps > 0:
+                self.project.export_defaults.fps = asset.fps
+            codec = asset.video_codec.lower()
+            if codec in {"h265", "hevc", "hev1", "hvc1"}:
+                self.project.export_defaults.codec = VideoCodec.H265
+            elif codec in {"av1", "av01"}:
+                self.project.export_defaults.codec = VideoCodec.AV1
+            elif codec in {"h264", "avc", "avc1"}:
+                self.project.export_defaults.codec = VideoCodec.H264
         start = self.timeline_duration_ms()
         clip = Clip(asset_id=asset.id, source_in_ms=0, source_out_ms=asset.duration_ms, timeline_start_ms=start)
         track.clips.append(clip)
@@ -136,6 +161,60 @@ class ProjectService:
         self.normalize_timeline()
         return True
 
+    def add_text(self, start_ms: int, end_ms: int) -> TextOverlay:
+        timeline = self.project.timeline
+        self.snapshot()
+        overlay = TextOverlay(
+            start_ms=max(0, start_ms),
+            end_ms=max(start_ms + 1, end_ms),
+            x_px=timeline.width // 10,
+            y_px=timeline.height - timeline.height // 5,
+        )
+        timeline.texts.append(overlay)
+        return overlay
+
+    def remove_text(self, text_id: str) -> bool:
+        texts = self.project.timeline.texts
+        for index, overlay in enumerate(texts):
+            if overlay.id == text_id:
+                self.snapshot()
+                del texts[index]
+                return True
+        return False
+
+    def update_text(self, text_id: str, **fields) -> bool:
+        overlay = self.text_by_id(text_id)
+        if overlay is None:
+            return False
+        changed = {
+            name: value for name, value in fields.items() if getattr(overlay, name) != value
+        }
+        if not changed:
+            return False
+        self.snapshot()
+        for name, value in changed.items():
+            setattr(overlay, name, value)
+        return True
+
+    def set_text_range(self, text_id: str, start_ms: int, end_ms: int) -> bool:
+        start_ms = max(0, start_ms)
+        if end_ms <= start_ms:
+            return False
+        return self.update_text(text_id, start_ms=start_ms, end_ms=end_ms)
+
+    def text_by_id(self, text_id: str) -> TextOverlay | None:
+        return next((text for text in self.project.timeline.texts if text.id == text_id), None)
+
+    @property
+    def texts(self) -> list[TextOverlay]:
+        return self.project.timeline.texts
+
+    def texts_at(self, timeline_ms: int) -> list[TextOverlay]:
+        return [
+            text for text in self.project.timeline.texts
+            if text.start_ms <= timeline_ms < text.end_ms
+        ]
+
     def reset_timeline_properties(self) -> bool:
         timeline, defaults = self.project.timeline, Timeline()
         current = (timeline.width, timeline.height, timeline.fps, timeline.master_volume)
@@ -151,9 +230,8 @@ class ProjectService:
         clip = self.clip_by_id(clip_id)
         if clip is None:
             return False
-        defaults = Clip()
         current = (clip.transform, clip.crop, clip.opacity, clip.volume, clip.speed)
-        reset = (defaults.transform, defaults.crop, defaults.opacity, defaults.volume, defaults.speed)
+        reset = (Transform(), Crop(), 1.0, 1.0, 1.0)
         if current == reset:
             return False
         self.snapshot()

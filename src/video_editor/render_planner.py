@@ -20,16 +20,12 @@ from .models import (
 @dataclass
 class RenderSegment:
     """One piece of a smart-render export: either stream-copied verbatim or
-    re-encoded. Re-encoded pieces are normalized to H.264/yuv420p/AAC so every
-    segment concatenates cleanly."""
+    re-encoded. Re-encoded pieces use the selected H.264/HEVC codec with
+    yuv420p and consistent AAC audio so every segment concatenates cleanly."""
 
     clip: Clip
     asset: MediaAsset
     encode: bool
-
-
-def _find_asset(project: Project, asset_id: str) -> MediaAsset | None:
-    return next((asset for asset in project.media if asset.id == asset_id), None)
 
 
 def _can_stream_copy_clip(clip, asset: MediaAsset) -> bool:
@@ -105,17 +101,6 @@ def _codec_matches(asset: MediaAsset, codec: VideoCodec) -> bool:
     return asset.video_codec.lower() in aliases[codec]
 
 
-def _container_family(value: str) -> str:
-    names = {item.strip().lower() for item in value.split(",") if item.strip()}
-    if "webm" in names:
-        return "webm"
-    if names & {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"}:
-        return "mov"
-    if names & {"matroska", "mkv"}:
-        return "matroska"
-    return next(iter(names), "")
-
-
 def _output_container(path: str) -> str:
     suffix = Path(path).suffix.lower()
     return {
@@ -125,14 +110,12 @@ def _output_container(path: str) -> str:
 
 
 def _audio_compatible(asset: MediaAsset, output_container: str) -> bool:
-    if not asset.has_audio:
-        return True
     codecs = {
         "mov": {"aac"},
         "matroska": {"aac", "mp3", "opus", "vorbis", "flac"},
         "webm": {"opus", "vorbis"},
     }
-    return asset.audio_codec.lower() in codecs.get(output_container, set())
+    return not asset.has_audio or asset.audio_codec.lower() in codecs.get(output_container, set())
 
 
 def _video_compatible(codec: VideoCodec, output_container: str) -> bool:
@@ -154,8 +137,7 @@ def can_stream_copy_profile(
         return False
     output_container = _output_container(profile.output_path)
     return _video_compatible(profile.codec, output_container) and all(
-        _container_family(asset.container) == output_container
-        and _codec_matches(asset, profile.codec)
+        _codec_matches(asset, profile.codec)
         and asset.width == profile.width
         and asset.height == profile.height
         and abs(asset.fps - profile.fps) <= 0.01
@@ -164,8 +146,15 @@ def can_stream_copy_profile(
     )
 
 
+def _visible_texts(project: Project) -> list:
+    return [
+        text for text in project.timeline.texts
+        if text.text.strip() and text.end_ms > text.start_ms
+    ]
+
+
 def build_render_plan(project: Project, profile: ExportProfile, resolved_backend: HardwareBackend) -> RenderPlan:
-    plan = RenderPlan(backend=resolved_backend)
+    plan = RenderPlan(backend=resolved_backend, texts=_visible_texts(project))
     video_clips = [
         clip
         for track in project.timeline.tracks
@@ -183,7 +172,7 @@ def build_render_plan(project: Project, profile: ExportProfile, resolved_backend
 
     assets = []
     for clip in video_clips:
-        asset = _find_asset(project, clip.asset_id)
+        asset = next((asset for asset in project.media if asset.id == clip.asset_id), None)
         if asset is None:
             plan.reason = "Clip media asset is missing"
             return plan
@@ -199,6 +188,14 @@ def build_render_plan(project: Project, profile: ExportProfile, resolved_backend
 
     if not profile.allow_stream_copy:
         plan.reason = "Stream copy disabled in profile"
+        return plan
+
+    # Captions are burned in by a drawtext filter, which a stream copy would
+    # silently drop.
+    if plan.texts:
+        if clip_count == 1 and plan.clip.has_canvas_transform:
+            plan.backend = HardwareBackend.CPU
+        plan.reason = "Text overlay requires reencode"
         return plan
 
     # A non-default master or per-clip volume needs an audio filter, which a
@@ -254,19 +251,18 @@ def build_render_plan(project: Project, profile: ExportProfile, resolved_backend
 def _segment_needs_encode(clip, asset: MediaAsset, profile: ExportProfile) -> bool:
     """A clip can be copied verbatim only if it is the whole source, untouched,
     and already in the output's format. Anything else must be reencoded."""
-    if abs(clip.speed - 1.0) > 1e-6 or clip.has_visual_transform or clip.has_audio_adjustment:
-        return True
-    if not _spans_full_source(clip, asset):
-        return True
-    if not _codec_matches(asset, profile.codec) or asset.pixel_format != "yuv420p":
-        return True
-    if asset.audio_codec != "aac" or not asset.has_audio:
-        return True
-    if asset.width != profile.width or asset.height != profile.height:
-        return True
-    if abs(asset.fps - profile.fps) > 0.01:
-        return True
-    return False
+    return (
+        abs(clip.speed - 1.0) > 1e-6
+        or clip.has_visual_transform
+        or clip.has_audio_adjustment
+        or not _spans_full_source(clip, asset)
+        or not _codec_matches(asset, profile.codec)
+        or asset.pixel_format != "yuv420p"
+        or (asset.has_audio and asset.audio_codec != "aac")
+        or asset.width != profile.width
+        or asset.height != profile.height
+        or abs(asset.fps - profile.fps) > 0.01
+    )
 
 
 def plan_smart_segments(
@@ -277,21 +273,27 @@ def plan_smart_segments(
 
     Returns the segment list when this is worthwhile and provably clean to
     concatenate, otherwise None (the caller falls back to the single-command
-    plan). Scoped to H.264/yuv420p/AAC timelines where every segment ends up
+    plan). Scoped to H.264/HEVC yuv420p timelines with either consistent AAC
+    audio or no audio, where every segment ends up
     identical in format — the case where a copy+encode concat is reliable."""
-    if not profile.allow_stream_copy or profile.codec != VideoCodec.H264:
+    if not profile.allow_stream_copy or profile.codec not in {VideoCodec.H264, VideoCodec.H265}:
+        return None
+    # Segments are encoded independently, each with its own timebase, so a
+    # timeline-wide between(t,…) caption window cannot be expressed per segment.
+    if _visible_texts(project):
         return None
     if abs(project.timeline.master_volume - 1.0) > 1e-6:
         return None
-    if len(clips) < 2:
+    if len(clips) < 2 or len(clips) != len(assets):
         return None
-    # Every clip must carry audio with identical sample rate / channels, so the
-    # copied and reencoded audio streams line up across the concat.
-    if not all(asset.has_audio for asset in assets):
+    # Audio presence and layout must match so copied and reencoded streams line
+    # up across the concat. Entirely silent timelines are safe too.
+    if len({asset.has_audio for asset in assets}) > 1:
         return None
-    if len({asset.audio_sample_rate for asset in assets}) > 1:
-        return None
-    if len({asset.audio_channels for asset in assets}) > 1:
+    if assets[0].has_audio and (
+        len({asset.audio_sample_rate for asset in assets}) > 1
+        or len({asset.audio_channels for asset in assets}) > 1
+    ):
         return None
 
     segments = [
@@ -305,12 +307,3 @@ def plan_smart_segments(
     if not (has_copy and has_encode):
         return None
     return segments
-
-
-class RenderPlanner:
-    plan = staticmethod(build_render_plan)
-    find_asset = staticmethod(_find_asset)
-    can_stream_copy_clip = staticmethod(_can_stream_copy_clip)
-    can_stream_copy_concat = staticmethod(_can_stream_copy_concat)
-    can_stream_copy_profile = staticmethod(can_stream_copy_profile)
-    plan_smart_segments = staticmethod(plan_smart_segments)
