@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QObject, QPoint, Qt, QTimer, Signal
-from PySide6.QtWidgets import QApplication, QGraphicsRectItem, QMessageBox, QScrollArea
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtWidgets import (
+    QApplication,
+    QGraphicsRectItem,
+    QGraphicsSceneMouseEvent,
+    QMessageBox,
+    QScrollArea,
+)
 import pytest
 
 from video_editor import ui
@@ -151,14 +157,37 @@ def test_space_keeps_native_button_behavior(window, qtbot):
 
 def test_export_defaults_persist_in_project(window):
     window.codec.setCurrentIndex(window.codec.findData(VideoCodec.H265))
+    window.export_fps.setValue(48.0)
     window.bitrate.setValue(18000)
     window.allow_stream_copy.setChecked(False)
 
     defaults = window.service.project.export_defaults
     assert defaults.codec == VideoCodec.H265
+    assert defaults.fps == 48.0
     assert defaults.bitrate_kbps == 18000
     assert not defaults.allow_stream_copy
     assert window.dirty
+
+
+def test_first_video_clip_updates_export_fps_and_codec_with_undo(window):
+    asset = MediaAsset(
+        path="source.mov",
+        video_codec="hevc",
+        fps=59.94,
+        duration_ms=1000,
+        has_video=True,
+    )
+    window.service.add_media(asset)
+    window.selected_asset_id = asset.id
+
+    window.add_selected_asset()
+
+    assert window.export_fps.value() == 59.94
+    assert window.codec.currentData() == VideoCodec.H265
+    window.undo()
+    assert window.export_fps.value() == 60.0
+    window.redo()
+    assert window.export_fps.value() == 59.94
 
 
 def test_dirty_new_project_can_discard(window, monkeypatch):
@@ -559,3 +588,153 @@ def test_undo_redo_covers_trim_split_transform_and_volume(window):
     assert len(window.service.video_track.clips) == 2
     window.redo()
     assert len(window.service.video_track.clips) == 3
+
+
+def test_caption_is_added_at_playhead_and_dragged_in_the_text_row(window, qtbot):
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    window.seek_timeline(500)
+    window.add_text_overlay()
+    overlay = window.service.texts[0]
+
+    assert (overlay.start_ms, overlay.end_ms) == (500, 3500)
+    assert window.selected_text_id == overlay.id
+    assert window.selected_clip_id == ""
+    assert window.text_card.isVisible()
+    assert window.preview_area.text_item.isVisible()
+
+    canvas = window.timeline_canvas
+    canvas.resize(900, canvas.height())
+    canvas.set_snapping(False)
+    lane_y = canvas.TEXT_LANE_TOP + canvas.TEXT_LANE_HEIGHT // 2
+    grab_x = int(canvas._ms_to_x(1000))
+    drop_x = int(canvas._ms_to_x(1600))
+
+    qtbot.mousePress(canvas, Qt.MouseButton.LeftButton, pos=QPoint(grab_x, lane_y))
+    assert canvas.mode == "drag_text"
+    qtbot.mouseMove(canvas, QPoint(drop_x, lane_y))
+    qtbot.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=QPoint(drop_x, lane_y))
+
+    assert canvas.mode == "idle"
+    # Pixel -> ms rounding makes the landing point approximate, not exact.
+    assert abs(overlay.start_ms - 1100) <= 5
+    assert overlay.duration_ms == 3000
+
+
+def test_caption_right_edge_trims_and_style_edits_are_undoable(window, qtbot):
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    window.add_text_overlay()
+    overlay = window.service.texts[0]
+
+    canvas = window.timeline_canvas
+    canvas.resize(900, canvas.height())
+    canvas.set_snapping(False)
+    lane_y = canvas.TEXT_LANE_TOP + canvas.TEXT_LANE_HEIGHT // 2
+    edge_x = int(canvas._ms_to_x(overlay.end_ms))
+    target_x = int(canvas._ms_to_x(1500))
+
+    qtbot.mousePress(canvas, Qt.MouseButton.LeftButton, pos=QPoint(edge_x, lane_y))
+    assert canvas.mode == "trim_text_right"
+    qtbot.mouseMove(canvas, QPoint(target_x, lane_y))
+    qtbot.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=QPoint(target_x, lane_y))
+
+    assert overlay.start_ms == 0
+    assert abs(overlay.end_ms - 1500) <= 5
+
+    window.text_content.setText("Subtitle")
+    window.text_size.setValue(64)
+    window.apply_text_properties()
+    assert window.service.texts[0].text == "Subtitle"
+    assert window.service.texts[0].size_px == 64
+
+    window.undo()
+    assert window.service.texts[0].text == "Caption"
+
+
+def test_dragging_the_caption_in_the_preview_moves_it(window, qtbot):
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    window.add_text_overlay()
+    overlay = window.service.texts[0]
+
+    window.preview_area.text_item.setPos(640, 300)
+    window.preview_area.text_item.moved(640, 300)
+
+    assert (overlay.x_px, overlay.y_px) == (640, 300)
+    assert (window.text_x.value(), window.text_y.value()) == (640, 300)
+
+
+def test_caption_dragged_near_the_middle_snaps_to_both_centre_axes(window, qtbot):
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    window.add_text_overlay()
+    overlay = window.service.texts[0]
+    item = window.preview_area.text_item
+    canvas_w, canvas_h = window.service.project.timeline.width, window.service.project.timeline.height
+    centre = item.centre_offset()
+    # Where the caption has to sit for its ink to be dead centre on the canvas.
+    centred = (canvas_w / 2 - centre.x(), canvas_h / 2 - centre.y())
+
+    item._dragging = True
+    item.setPos(centred[0] + 12, centred[1] - 12)
+    assert (item.pos().x(), item.pos().y()) == centred
+    assert window.preview_area.centre_guides[0].isVisible()
+    assert window.preview_area.centre_guides[1].isVisible()
+
+    # Only the axis that is near the middle snaps; the other one is left alone.
+    item.setPos(centred[0] + 400, centred[1] - 5)
+    assert item.pos().x() == centred[0] + 400
+    assert item.pos().y() == centred[1]
+    assert not window.preview_area.centre_guides[0].isVisible()
+
+    item.mouseReleaseEvent(QGraphicsSceneMouseEvent(QEvent.Type.GraphicsSceneMouseRelease))
+    assert not item._dragging
+    assert (overlay.x_px, overlay.y_px) == (round(centred[0] + 400), round(centred[1]))
+    assert not window.preview_area.centre_guides[1].isVisible()
+
+    # A value typed into the inspector is never silently pulled to the centre.
+    window.text_x.setValue(int(centred[0]) + 3)
+    window.text_y.setValue(int(centred[1]) + 3)
+    window.apply_text_properties()
+    assert (overlay.x_px, overlay.y_px) == (int(centred[0]) + 3, int(centred[1]) + 3)
+
+
+def test_caption_preview_anchors_ink_where_drawtext_puts_it(window, qtbot):
+    """drawtext's y is the top of the rendered ink, and its border grows
+    outward — so the preview glyphs must not move when the outline changes."""
+    from PySide6.QtGui import QFontMetricsF
+
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    window.add_text_overlay()
+    item = window.preview_area.text_item
+
+    window.text_size.setValue(48)
+    window.text_outline.setValue(0)
+    window.apply_text_properties()
+    ink = item.path().boundingRect()
+    assert ink.top() == pytest.approx(0.0, abs=0.01)
+
+    metrics = QFontMetricsF(ui.caption_font("Arial", 48))
+    assert ink.height() == pytest.approx(metrics.tightBoundingRect("Caption").height(), abs=1.0)
+
+    window.text_outline.setValue(12)
+    window.apply_text_properties()
+    assert item.path().boundingRect() == ink
+    # Twice borderw, so the half hidden under the fill leaves borderw showing.
+    assert item.pen().widthF() == pytest.approx(24.0)
+
+
+def test_space_toggles_playback_but_not_while_typing_a_caption(window, qtbot):
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    window.add_text_overlay()
+
+    window.text_content.setFocus()
+    qtbot.keyClick(window.text_content, Qt.Key.Key_Space)
+    assert window.player.playbackState() != _PlayerStub.PlaybackState.PlayingState
+
+    window.timeline_canvas.setFocus()
+    qtbot.keyClick(window, Qt.Key.Key_Space)
+    assert window.player.playbackState() == _PlayerStub.PlaybackState.PlayingState

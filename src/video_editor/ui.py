@@ -26,7 +26,18 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygonF, QTransform
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QIcon,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygonF,
+    QTransform,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtSvg import QSvgRenderer
@@ -36,12 +47,15 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
     QGraphicsItem,
+    QGraphicsLineItem,
+    QGraphicsPathItem,
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
@@ -72,7 +86,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .ffmpeg import build_ffmpeg_command, build_smart_render_commands
+from .ffmpeg import FONT_FILES, build_ffmpeg_command, build_smart_render_commands
 from .hardware import choose_backend, detect_hardware_cached, supported_backends_for_platform
 from .media import create_thumbnail, probe_media, thumbnail_path
 from .models import ExportProfile, HardwareBackend, Project, RenderRoute, Timeline, Track, TrackType, VideoCodec
@@ -204,6 +218,90 @@ class _CanvasView(QGraphicsView):
         self.refit()
 
 
+def caption_font(family: str, size_px: int) -> QFont:
+    """The Qt font for the file drawtext will load. "Arial Bold" is arialbd.ttf,
+    which Qt resolves through the bold weight rather than the family name."""
+    font = QFont(family.removesuffix(" Bold"))
+    font.setBold(family.endswith(" Bold"))
+    font.setPixelSize(max(1, size_px))
+    return font
+
+
+class _PreviewTextItem(QGraphicsPathItem):
+    """Draggable caption proxy. Scene coordinates are canvas pixels, so the
+    position it reports is exactly what drawtext gets on export.
+
+    Glyphs are carried as a path rather than as text so the preview can match
+    drawtext on the two things a text item gets wrong: drawtext anchors y on the
+    top of the rendered ink (not on the font ascent), and it grows the border
+    outward from the glyph instead of stroking over it."""
+
+    #: Centre-snap tolerance, in canvas pixels.
+    SNAP_PX = 20
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+        self.setZValue(10)
+        self.setVisible(False)
+        self.moved = None
+        self.snapped = None
+        self.canvas_width = 1920
+        self.canvas_height = 1080
+        self._dragging = False
+
+    def set_caption(self, text: str, font: QFont) -> None:
+        """Lay the glyphs out with their ink top-left at the item origin, which
+        is where drawtext puts x/y."""
+        path = QPainterPath()
+        path.addText(0, 0, font, text)
+        path.translate(0, -path.boundingRect().top())
+        self.setPath(path)
+
+    def centre_offset(self) -> QPointF:
+        """Item-local centre of the ink — what the eye centres on, and what the
+        centre snap lines up with the canvas middle."""
+        return self.path().boundingRect().center()
+
+    def paint(self, painter, option, widget=None) -> None:
+        # Stroke first, fill over it: drawtext's border only ever grows outward,
+        # so a centred stroke of twice the width leaves exactly borderw showing.
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if self.pen().style() != Qt.PenStyle.NoPen:
+            painter.setPen(self.pen())
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(self.path())
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.brush())
+        painter.drawPath(self.path())
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and self._dragging:
+            centre = self.centre_offset()
+            snap_x = abs(value.x() + centre.x() - self.canvas_width / 2) <= self.SNAP_PX
+            snap_y = abs(value.y() + centre.y() - self.canvas_height / 2) <= self.SNAP_PX
+            value = QPointF(
+                self.canvas_width / 2 - centre.x() if snap_x else value.x(),
+                self.canvas_height / 2 - centre.y() if snap_y else value.y(),
+            )
+            if self.snapped is not None:
+                self.snapped(snap_x, snap_y)
+        return super().itemChange(change, value)
+
+    def mousePressEvent(self, event) -> None:
+        self._dragging = True
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        self._dragging = False
+        if self.snapped is not None:
+            self.snapped(False, False)
+        if self.moved is not None:
+            self.moved(int(round(self.pos().x())), int(round(self.pos().y())))
+
+
 class PreviewArea(QWidget):
     """Holds the video preview inside a canvas-shaped frame whose aspect ratio
     follows the selected export mode (16:9 for YouTube, 9:16 for TikTok).
@@ -230,6 +328,19 @@ class PreviewArea(QWidget):
         self.video_item = QGraphicsVideoItem(self.clip_frame)
         self.video_item.setAspectRatioMode(Qt.AspectRatioMode.IgnoreAspectRatio)
         self.scene.addItem(self.clip_frame)
+        # A scene-level sibling, not a child of clip_frame: captions must not
+        # inherit the clip's crop, scale or rotation.
+        self.text_item = _PreviewTextItem()
+        self.scene.addItem(self.text_item)
+        self.text_item.snapped = self._show_centre_guides
+        self.centre_guides = []
+        for _ in range(2):
+            guide = QGraphicsLineItem()
+            guide.setPen(QPen(QColor("#4cc2ff"), 2, Qt.PenStyle.DashLine))
+            guide.setZValue(11)
+            guide.setVisible(False)
+            self.scene.addItem(guide)
+            self.centre_guides.append(guide)
         self.view = _CanvasView(self.scene)
         self.view.setObjectName("previewView")
         inner.addWidget(self.view)
@@ -241,8 +352,16 @@ class PreviewArea(QWidget):
         self.canvas_height = max(1, height)
         self._ratio = self.canvas_width / self.canvas_height
         self.scene.setSceneRect(0, 0, self.canvas_width, self.canvas_height)
+        self.text_item.canvas_width = self.canvas_width
+        self.text_item.canvas_height = self.canvas_height
+        self.centre_guides[0].setLine(self.canvas_width / 2, 0, self.canvas_width / 2, self.canvas_height)
+        self.centre_guides[1].setLine(0, self.canvas_height / 2, self.canvas_width, self.canvas_height / 2)
         self.view.refit()
         self._reflow()
+
+    def _show_centre_guides(self, x_snapped: bool, y_snapped: bool) -> None:
+        self.centre_guides[0].setVisible(x_snapped)
+        self.centre_guides[1].setVisible(y_snapped)
 
     def apply_clip(self, asset, clip) -> None:
         """Mirror the clip's crop/scale/position on the canvas; a bare asset
@@ -276,6 +395,25 @@ class PreviewArea(QWidget):
         self.clip_frame.setPos(offset)
         self.clip_frame.setRotation(clip.transform.rotation_deg if clip is not None else 0.0)
         self.clip_frame.setOpacity(max(0.0, min(1.0, clip.opacity if clip is not None else 1.0)))
+
+    def set_text(self, overlay) -> None:
+        """Show one caption on the canvas, styled to match the drawtext export."""
+        if overlay is None:
+            self.text_item.setVisible(False)
+            self._show_centre_guides(False, False)
+            return
+        self.text_item.set_caption(overlay.text, caption_font(overlay.font, overlay.size_px))
+        self.text_item.setBrush(QColor(overlay.color))
+        self.text_item.setPen(
+            # Twice the border: paint() hides the inner half under the fill, so
+            # what is left matches drawtext's outward-only borderw.
+            QPen(QColor(overlay.outline_color), overlay.outline_px * 2,
+                 Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            if overlay.outline_px > 0
+            else QPen(Qt.PenStyle.NoPen)
+        )
+        self.text_item.setPos(overlay.x_px, overlay.y_px)
+        self.text_item.setVisible(True)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -342,15 +480,22 @@ def _format_ms(value: int, show_ms: bool = False) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}{suffix}"
 
 
+_TEXT_MODES = ("drag_text", "trim_text_left", "trim_text_right")
+
+
 class TimelineCanvas(QWidget):
     clip_selected = Signal(str)
     seek_requested = Signal(int)
     move_committed = Signal(str, int)
     trim_committed = Signal(str, object, object)
+    text_selected = Signal(str)
+    text_range_committed = Signal(str, int, int)
 
     MARGIN = 14
     LANE_TOP = 56
     LANE_HEIGHT = 48
+    TEXT_LANE_TOP = 108
+    TEXT_LANE_HEIGHT = 24
     RULER_TOP = 24
     RULER_BOTTOM = 50
     EDGE_HIT_PX = 6
@@ -363,6 +508,10 @@ class TimelineCanvas(QWidget):
         super().__init__()
         self.service = service
         self.selected_clip_id = ""
+        self.selected_text_id = ""
+        self.active_text_id = ""
+        self.preview_text_start_ms = 0
+        self.preview_text_end_ms = 0
         self.playhead_ms = 0
         self.zoom_factor = 1.0
         self.pan_offset_ms = 0
@@ -376,11 +525,12 @@ class TimelineCanvas(QWidget):
         self.pan_anchor_x = 0.0
         self.pan_anchor_offset_ms = 0
         self.snap_enabled = True
-        self.setMinimumHeight(136)
+        self.setMinimumHeight(152)
         self.setMouseTracking(True)
 
-    def set_selection(self, clip_id: str) -> None:
+    def set_selection(self, clip_id: str, text_id: str = "") -> None:
         self.selected_clip_id = clip_id
+        self.selected_text_id = text_id
         self.update()
 
     def set_playhead(self, timeline_ms: int) -> None:
@@ -425,10 +575,10 @@ class TimelineCanvas(QWidget):
     def _tick_interval_ms(self) -> int:
         vis = self._visible_duration_ms()
         target = max(1, vis // 8)
-        for candidate in self.TICK_CANDIDATES_MS:
-            if candidate >= target:
-                return candidate
-        return self.TICK_CANDIDATES_MS[-1]
+        return next(
+            (candidate for candidate in self.TICK_CANDIDATES_MS if candidate >= target),
+            self.TICK_CANDIDATES_MS[-1],
+        )
 
     def _clip_under(self, timeline_ms: int):
         for clip in self.service.visible_video_clips(timeline_ms, timeline_ms + 1):
@@ -447,11 +597,15 @@ class TimelineCanvas(QWidget):
         view_end = self.pan_offset_ms + vis
         clips = self.service.visible_video_clips(self.pan_offset_ms, view_end)
 
-        # Lane background band so the clip track reads as a distinct surface.
-        lane_rect = QRectF(self.MARGIN, self.LANE_TOP, self._content_width(), self.LANE_HEIGHT)
+        # Lane background bands so each track reads as a distinct surface.
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor("#1e2024"))
-        painter.drawRoundedRect(lane_rect, 6, 6)
+        painter.drawRoundedRect(
+            QRectF(self.MARGIN, self.LANE_TOP, self._content_width(), self.LANE_HEIGHT), 6, 6
+        )
+        painter.drawRoundedRect(
+            QRectF(self.MARGIN, self.TEXT_LANE_TOP, self._content_width(), self.TEXT_LANE_HEIGHT), 6, 6
+        )
 
         painter.setPen(QPen(QColor(TEXT_FAINT), 1))
         fine_time = self._tick_interval_ms() < 1000
@@ -512,6 +666,25 @@ class TimelineCanvas(QWidget):
             painter.setPen(QColor("#f4f6f9" if selected else TEXT))
             painter.drawText(rect.adjusted(10, 8, -10, -4), Qt.AlignmentFlag.AlignVCenter, label)
 
+        for overlay in self.service.texts:
+            start_ms, end_ms = overlay.start_ms, overlay.end_ms
+            if overlay.id == self.active_text_id and self.mode in _TEXT_MODES:
+                start_ms, end_ms = self.preview_text_start_ms, self.preview_text_end_ms
+            if end_ms < self.pan_offset_ms or start_ms > view_end:
+                continue
+            start_x = self._ms_to_x(start_ms)
+            width = max(18.0, self._ms_to_x(end_ms) - start_x)
+            rect = QRectF(start_x, self.TEXT_LANE_TOP, width, self.TEXT_LANE_HEIGHT)
+            selected = overlay.id == self.selected_text_id
+            painter.setBrush(QColor(ACCENT if selected else "#3a4150"))
+            painter.setPen(QPen(QColor(ACCENT_HOVER if selected else BORDER_STRONG), 2 if selected else 1))
+            painter.drawRoundedRect(rect, 4, 4)
+            label = painter.fontMetrics().elidedText(
+                overlay.text or "Text", Qt.TextElideMode.ElideRight, int(rect.width()) - 12
+            )
+            painter.setPen(QColor("#f4f6f9" if selected else TEXT))
+            painter.drawText(rect.adjusted(6, 0, -6, 0), Qt.AlignmentFlag.AlignVCenter, label)
+
         playhead_x = self._ms_to_x(min(self.playhead_ms, duration))
         if self.MARGIN <= playhead_x <= self.width() - self.MARGIN:
             painter.setPen(QPen(QColor(PLAYHEAD), 2))
@@ -526,14 +699,60 @@ class TimelineCanvas(QWidget):
                 QPointF(tip, self.RULER_TOP + 2),
             ]))
 
-    def _edge_zone(self, x: float, clip):
-        start_x = self._ms_to_x(clip.timeline_start_ms)
-        end_x = self._ms_to_x(clip.timeline_start_ms + clip.duration_ms)
-        if abs(x - start_x) <= self.EDGE_HIT_PX:
+    def _edge_zone(self, x: float, start_ms: int, end_ms: int):
+        if abs(x - self._ms_to_x(start_ms)) <= self.EDGE_HIT_PX:
             return "left"
-        if abs(x - end_x) <= self.EDGE_HIT_PX:
+        if abs(x - self._ms_to_x(end_ms)) <= self.EDGE_HIT_PX:
             return "right"
         return None
+
+    def _clip_edge_zone(self, x: float, clip):
+        return self._edge_zone(x, clip.timeline_start_ms, clip.timeline_start_ms + clip.duration_ms)
+
+    def _text_under(self, x: float):
+        """Hit-test in pixels, widened by the edge grab zone: the trim handles
+        sit on the bar's boundaries, so a strictly-inside test would make the
+        end edge (and any very short caption) impossible to grab."""
+        # Reversed so the topmost (last painted) overlay wins when they overlap.
+        for overlay in reversed(self.service.texts):
+            start_x = self._ms_to_x(overlay.start_ms) - self.EDGE_HIT_PX
+            end_x = self._ms_to_x(overlay.end_ms) + self.EDGE_HIT_PX
+            if start_x <= x <= end_x:
+                return overlay
+        return None
+
+    def _press_text_lane(self, x: float, timeline_ms: int) -> None:
+        overlay = self._text_under(x)
+        if overlay is None:
+            return
+        self.active_text_id = overlay.id
+        self.preview_text_start_ms = overlay.start_ms
+        self.preview_text_end_ms = overlay.end_ms
+        self.text_selected.emit(overlay.id)
+        edge = self._edge_zone(x, overlay.start_ms, overlay.end_ms)
+        if edge:
+            self.mode = "trim_text_left" if edge == "left" else "trim_text_right"
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            self.mode = "drag_text"
+            self.drag_anchor_ms = timeline_ms - overlay.start_ms
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _move_text_lane(self, timeline_ms: int) -> None:
+        overlay = self.service.text_by_id(self.active_text_id)
+        if overlay is None:
+            return
+        if self.mode == "drag_text":
+            start = max(0, self._snap_time(max(0, timeline_ms - self.drag_anchor_ms)))
+            self.preview_text_start_ms = start
+            self.preview_text_end_ms = start + overlay.duration_ms
+        elif self.mode == "trim_text_left":
+            edge = self._snap_time(timeline_ms)
+            self.preview_text_start_ms = max(0, min(edge, overlay.end_ms - self.MIN_CLIP_MS))
+        else:
+            edge = self._snap_time(timeline_ms)
+            self.preview_text_end_ms = max(edge, overlay.start_ms + self.MIN_CLIP_MS)
+        self.update()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.RightButton:
@@ -555,6 +774,9 @@ class TimelineCanvas(QWidget):
             self.setCursor(Qt.CursorShape.SplitHCursor)
             return
         self.press_x = x
+        if self.TEXT_LANE_TOP <= y <= self.TEXT_LANE_TOP + self.TEXT_LANE_HEIGHT:
+            self._press_text_lane(x, timeline_ms)
+            return
         in_lane = self.LANE_TOP <= y <= self.LANE_TOP + self.LANE_HEIGHT
         clip = self._clip_under(timeline_ms) if in_lane else None
         if clip is None:
@@ -564,7 +786,7 @@ class TimelineCanvas(QWidget):
         self.preview_in_ms = clip.source_in_ms
         self.preview_out_ms = clip.source_out_ms
         self.clip_selected.emit(clip.id)
-        edge = self._edge_zone(x, clip)
+        edge = self._clip_edge_zone(x, clip)
         if edge == "left":
             self.mode = "trim_left"
             self.drag_anchor_ms = timeline_ms
@@ -592,6 +814,9 @@ class TimelineCanvas(QWidget):
             self.update()
             return
         timeline_ms = self._x_to_ms(x)
+        if self.mode in _TEXT_MODES:
+            self._move_text_lane(timeline_ms)
+            return
         clip = self.service.clip_by_id(self.active_clip_id)
         if self.mode == "drag_clip" and clip is not None:
             target = max(0, timeline_ms - self.drag_anchor_ms)
@@ -626,6 +851,16 @@ class TimelineCanvas(QWidget):
         clip_id = self.active_clip_id
         release_x = float(event.position().x())
         moved = abs(release_x - self.press_x) > 3
+        if mode in _TEXT_MODES:
+            if moved and self.active_text_id:
+                self.text_range_committed.emit(
+                    self.active_text_id, self.preview_text_start_ms, self.preview_text_end_ms
+                )
+            self.mode = "idle"
+            self.active_text_id = ""
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+            return
         if mode == "drag_clip" and clip_id:
             if moved:
                 self.move_committed.emit(clip_id, self.preview_start_ms)
@@ -662,11 +897,20 @@ class TimelineCanvas(QWidget):
             self.setCursor(Qt.CursorShape.SplitHCursor)
             return
         timeline_ms = self._x_to_ms(x)
+        if self.TEXT_LANE_TOP <= y <= self.TEXT_LANE_TOP + self.TEXT_LANE_HEIGHT:
+            overlay = self._text_under(x)
+            if overlay is None:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            elif self._edge_zone(x, overlay.start_ms, overlay.end_ms):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            else:
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
         clip = self._clip_under(timeline_ms) if y <= self.LANE_TOP + self.LANE_HEIGHT else None
         if clip is None:
             self.setCursor(Qt.CursorShape.ArrowCursor)
             return
-        edge = self._edge_zone(x, clip)
+        edge = self._clip_edge_zone(x, clip)
         if edge:
             self.setCursor(Qt.CursorShape.SizeHorCursor)
         else:
@@ -687,10 +931,7 @@ class ExportWorker(QThread):
         self.cancelled = False
 
     def _all_temp_files(self) -> list[str]:
-        temps: list[str] = []
-        for command, _ in self.jobs:
-            temps.extend(command.temporary_files)
-        return temps
+        return [path for command, _ in self.jobs for path in command.temporary_files]
 
     def run(self) -> None:
         total = sum(max(1, weight) for _, weight in self.jobs) or 1
@@ -744,10 +985,7 @@ class ExportWorker(QThread):
             self.finished_with_code.emit(-1)
         finally:
             for path in self._all_temp_files():
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
+                Path(path).unlink(missing_ok=True)
 
     def cancel(self) -> None:
         self.cancelled = True
@@ -802,6 +1040,8 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("FastVideoEditor", "FastVideoEditor")
         self.selected_asset_id = ""
         self.selected_clip_id = ""
+        self.selected_text_id = ""
+        self._preview_text_id = ""
         self.playing_clip_id = ""
         self.playhead_ms = 0
         self.ignore_player_position = False
@@ -1058,6 +1298,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         self.preview_area = PreviewArea()
+        self.preview_area.text_item.moved = self._on_preview_text_moved
         self.player.setVideoOutput(self.preview_area.video_item)
         layout.addWidget(self.preview_area, 1)
 
@@ -1115,12 +1356,17 @@ class MainWindow(QMainWindow):
         self.timeline_canvas.seek_requested.connect(self.seek_timeline)
         self.timeline_canvas.move_committed.connect(self.on_clip_moved)
         self.timeline_canvas.trim_committed.connect(self.on_clip_trimmed)
+        self.timeline_canvas.text_selected.connect(self.select_text_by_id)
+        self.timeline_canvas.text_range_committed.connect(self.on_text_range_changed)
         timeline_layout.addWidget(self.timeline_canvas)
 
         edit_row = QHBoxLayout()
         edit_row.setSpacing(8)
         split_button = QPushButton("Split at Playhead")
         split_button.clicked.connect(self.split_selected_clip)
+        add_text_button = QPushButton("Add Text")
+        add_text_button.setToolTip("Add a caption at the playhead; drag its bar in the text row to retime it")
+        add_text_button.clicked.connect(self.add_text_overlay)
         trim_left_button = QPushButton("Trim Left")
         trim_left_button.setToolTip("Move the clip's left edge (start) to the playhead")
         trim_left_button.clicked.connect(self.set_trim_in_to_playhead)
@@ -1128,6 +1374,7 @@ class MainWindow(QMainWindow):
         trim_right_button.setToolTip("Move the clip's right edge (end) to the playhead")
         trim_right_button.clicked.connect(self.set_trim_out_to_playhead)
         edit_row.addWidget(split_button)
+        edit_row.addWidget(add_text_button)
         edit_row.addStretch()
         edit_row.addWidget(trim_left_button)
         edit_row.addWidget(trim_right_button)
@@ -1269,6 +1516,60 @@ class MainWindow(QMainWindow):
         ins_layout.addLayout(crop_grid)
         outer.addWidget(inspector)
 
+        # --- Text card ---
+        text_card, text_layout = self._card("Text")
+        self.text_card = text_card
+        self.text_content = QLineEdit()
+        self.text_content.setAccessibleName("Caption text")
+        self.text_content.setPlaceholderText("Caption text")
+        self.text_content.textEdited.connect(self.apply_text_properties)
+        text_layout.addWidget(self.text_content)
+
+        self.text_font = QComboBox()
+        self.text_font.setAccessibleName("Caption font")
+        for name in FONT_FILES:
+            self.text_font.addItem(name)
+        self.text_font.currentIndexChanged.connect(self.apply_text_properties)
+        self.text_size = self._spin(8, 400, suffix=" px")
+        self.text_size.setAccessibleName("Caption size")
+        self.text_outline = self._spin(0, 20, suffix=" px")
+        self.text_outline.setAccessibleName("Caption outline width")
+        self.text_x = self._spin(-10000, 10000, suffix=" px")
+        self.text_x.setAccessibleName("Caption position X")
+        self.text_y = self._spin(-10000, 10000, suffix=" px")
+        self.text_y.setAccessibleName("Caption position Y")
+        for spin in (self.text_size, self.text_outline, self.text_x, self.text_y):
+            spin.valueChanged.connect(self.apply_text_properties)
+
+        self.text_color_button = QPushButton()
+        self.text_color_button.setAccessibleName("Caption fill colour")
+        self.text_color_button.clicked.connect(lambda: self._pick_text_color("color"))
+        self.text_outline_color_button = QPushButton()
+        self.text_outline_color_button.setAccessibleName("Caption outline colour")
+        self.text_outline_color_button.clicked.connect(lambda: self._pick_text_color("outline_color"))
+
+        text_form = QFormLayout()
+        text_form.setSpacing(8)
+        text_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        text_form.addRow(self._field_label("Font", self.text_font), self.text_font)
+        text_form.addRow(self._field_label("Size", self.text_size), self.text_size)
+        text_form.addRow(self._field_label("Colour", self.text_color_button), self.text_color_button)
+        text_form.addRow(self._field_label("Outline", self.text_outline_color_button), self.text_outline_color_button)
+        text_form.addRow(self._field_label("Outline width", self.text_outline), self.text_outline)
+        text_form.addRow(self._field_label("Position X", self.text_x), self.text_x)
+        text_form.addRow(self._field_label("Position Y", self.text_y), self.text_y)
+        text_layout.addLayout(text_form)
+
+        text_hint = QLabel("Drag the caption in the preview to move it, or its bar in the text row to retime it.")
+        text_hint.setObjectName("cardHint")
+        text_hint.setWordWrap(True)
+        text_layout.addWidget(text_hint)
+        remove_text_button = QPushButton("Remove Text")
+        remove_text_button.clicked.connect(self.remove_text_overlay)
+        text_layout.addWidget(remove_text_button)
+        text_card.setVisible(False)
+        outer.addWidget(text_card)
+
         # --- Export card ---
         export_card, exp_layout = self._card("Export")
         self.codec = QComboBox()
@@ -1279,6 +1580,14 @@ class MainWindow(QMainWindow):
         self.backend.setAccessibleName("Export encoder")
         for backend in supported_backends_for_platform():
             self.backend.addItem(backend.value.upper() if backend != HardwareBackend.AUTO else "Auto", backend)
+        self.export_fps = QDoubleSpinBox()
+        self.export_fps.setRange(1.0, 240.0)
+        self.export_fps.setDecimals(3)
+        self.export_fps.setSingleStep(1.0)
+        self.export_fps.setSuffix(" fps")
+        self.export_fps.setValue(60.0)
+        self.export_fps.setAccessibleName("Export frame rate")
+        self.export_fps.setToolTip("Match the source FPS to keep untouched clips eligible for stream copy")
         self.bitrate = self._spin(500, 200000, suffix=" kbps")
         self.bitrate.setAccessibleName("Export bitrate")
         self.bitrate.setValue(12000)
@@ -1294,11 +1603,13 @@ class MainWindow(QMainWindow):
         export_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         export_form.addRow(self._field_label("Codec", self.codec), self.codec)
         export_form.addRow(self._field_label("Encoder", self.backend), self.backend)
+        export_form.addRow(self._field_label("Frame rate", self.export_fps), self.export_fps)
         export_form.addRow(self._field_label("Bitrate", self.bitrate), self.bitrate)
         exp_layout.addLayout(export_form)
         exp_layout.addWidget(self.allow_stream_copy)
         self.codec.currentIndexChanged.connect(self._save_export_defaults)
         self.backend.currentIndexChanged.connect(self._save_export_defaults)
+        self.export_fps.valueChanged.connect(self._save_export_defaults)
         self.bitrate.valueChanged.connect(self._save_export_defaults)
         self.allow_stream_copy.toggled.connect(self._save_export_defaults)
 
@@ -1663,22 +1974,36 @@ class MainWindow(QMainWindow):
         values = (
             self.codec.currentData() or VideoCodec.H264,
             self.backend.currentData() or HardwareBackend.AUTO,
+            self.export_fps.value(),
             self.bitrate.value(),
             self.allow_stream_copy.isChecked(),
         )
-        previous = (defaults.codec, defaults.hardware_backend, defaults.bitrate_kbps, defaults.allow_stream_copy)
+        previous = (
+            defaults.codec,
+            defaults.hardware_backend,
+            defaults.fps,
+            defaults.bitrate_kbps,
+            defaults.allow_stream_copy,
+        )
         if values == previous:
             return
-        defaults.codec, defaults.hardware_backend, defaults.bitrate_kbps, defaults.allow_stream_copy = values
+        (
+            defaults.codec,
+            defaults.hardware_backend,
+            defaults.fps,
+            defaults.bitrate_kbps,
+            defaults.allow_stream_copy,
+        ) = values
         self._set_dirty()
 
     def _apply_export_defaults(self) -> None:
         defaults = self.service.project.export_defaults
-        widgets = [self.codec, self.backend, self.bitrate, self.allow_stream_copy]
+        widgets = [self.codec, self.backend, self.export_fps, self.bitrate, self.allow_stream_copy]
         for widget in widgets:
             widget.blockSignals(True)
         self.codec.setCurrentIndex(max(0, self.codec.findData(defaults.codec)))
         self.backend.setCurrentIndex(max(0, self.backend.findData(defaults.hardware_backend)))
+        self.export_fps.setValue(defaults.fps)
         self.bitrate.setValue(defaults.bitrate_kbps)
         self.allow_stream_copy.setChecked(defaults.allow_stream_copy)
         for widget in widgets:
@@ -1773,9 +2098,11 @@ class MainWindow(QMainWindow):
         self.playhead_slider.setMaximum(duration)
         self.playhead_slider.setEnabled(duration > 0)
         self.playhead_slider.setValue(min(self.playhead_ms, duration))
-        self.timeline_canvas.set_selection(self.selected_clip_id)
+        self.timeline_canvas.set_selection(self.selected_clip_id, self.selected_text_id)
         self.timeline_canvas.set_playhead(self.playhead_ms)
         self.update_time_label()
+        self._update_text_card()
+        self._refresh_preview_text(force=True)
 
         master_pct = int(round(self.service.project.timeline.master_volume * 100))
         self.master_slider.blockSignals(True)
@@ -1810,6 +2137,7 @@ class MainWindow(QMainWindow):
         """Clear selections and playback after the whole project is replaced."""
         self.selected_asset_id = ""
         self.selected_clip_id = ""
+        self.selected_text_id = ""
         self.playing_clip_id = ""
         self.playhead_ms = 0
         self._stop_sampled_preview()
@@ -1836,7 +2164,6 @@ class MainWindow(QMainWindow):
             return
         try:
             project = load_project(path)
-            self._validate_project(project)
         except Exception as exc:
             QMessageBox.critical(self, "Open failed", f"The project was not changed.\n\n{exc}")
             return
@@ -1893,20 +2220,6 @@ class MainWindow(QMainWindow):
             self._set_dirty(False)
             return True
         return False
-
-    @staticmethod
-    def _validate_project(project: Project) -> None:
-        if project.timeline.width <= 0 or project.timeline.height <= 0 or project.timeline.fps <= 0:
-            raise ValueError("Timeline dimensions and frame rate must be positive")
-        asset_ids = {asset.id for asset in project.media}
-        if len(asset_ids) != len(project.media):
-            raise ValueError("The project contains duplicate media identifiers")
-        for track in project.timeline.tracks:
-            for clip in track.clips:
-                if clip.asset_id not in asset_ids:
-                    raise ValueError(f"Clip {clip.id or '<unnamed>'} refers to unknown media")
-                if clip.source_out_ms <= clip.source_in_ms:
-                    raise ValueError(f"Clip {clip.id or '<unnamed>'} has an invalid source range")
 
     def import_media(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -2027,6 +2340,7 @@ class MainWindow(QMainWindow):
         if not self.selected_asset_id:
             return
         clip = self.service.add_asset_to_timeline(self.selected_asset_id)
+        self._apply_export_defaults()
         self.refresh(media=False)
         self._set_dirty()
         self.select_clip_by_id(clip.id, seek=True)
@@ -2067,7 +2381,11 @@ class MainWindow(QMainWindow):
                 self.timeline_table.scrollToItem(item)
                 break
         self.timeline_table.blockSignals(False)
+        # Clip and caption selection are mutually exclusive — one inspector card
+        # at a time.
+        self.selected_text_id = ""
         self.timeline_canvas.set_selection(self.selected_clip_id)
+        self._update_text_card()
         self._update_inspector(clip)
         self.add_button.setEnabled(bool(self.selected_asset_id))
         self.delete_action.setEnabled(bool(self.selected_clip_id))
@@ -2255,6 +2573,7 @@ class MainWindow(QMainWindow):
             self._sync_dirty()
             self.playhead_ms = min(self.playhead_ms, self.service.timeline_duration_ms())
             self.refresh()
+            self._apply_export_defaults()
             self._sync_mode_from_timeline()
 
     def redo(self) -> None:
@@ -2262,10 +2581,135 @@ class MainWindow(QMainWindow):
             self._sync_dirty()
             self.playhead_ms = min(self.playhead_ms, self.service.timeline_duration_ms())
             self.refresh()
+            self._apply_export_defaults()
             self._sync_mode_from_timeline()
 
     def select_clip_by_id(self, clip_id: str, seek: bool = True) -> None:
         self._set_selection(clip_id=clip_id, seek=seek)
+
+    # --- Captions -----------------------------------------------------------
+
+    def add_text_overlay(self) -> None:
+        overlay = self.service.add_text(self.playhead_ms, self.playhead_ms + 3000)
+        self._set_dirty()
+        self.refresh(media=False)
+        self.select_text_by_id(overlay.id)
+        self.text_content.setFocus()
+        self.text_content.selectAll()
+        self.statusBar().showMessage("Caption added — drag its bar in the text row to retime it")
+
+    def remove_text_overlay(self) -> None:
+        if not self.service.remove_text(self.selected_text_id):
+            return
+        self._set_dirty()
+        self.select_text_by_id("")
+        self.refresh(media=False)
+        self.statusBar().showMessage("Caption removed")
+
+    def select_text_by_id(self, text_id: str) -> None:
+        self.selected_text_id = text_id
+        if text_id:
+            # A caption and a clip are never selected at once.
+            self.selected_clip_id = ""
+            self.timeline_table.blockSignals(True)
+            self.timeline_table.clearSelection()
+            self.timeline_table.blockSignals(False)
+            self._update_inspector(None)
+        self.timeline_canvas.set_selection(self.selected_clip_id, text_id)
+        self._update_text_card()
+        self._refresh_preview_text(force=True)
+
+    def on_text_range_changed(self, text_id: str, start_ms: int, end_ms: int) -> None:
+        if not self.service.set_text_range(text_id, start_ms, end_ms):
+            return
+        self._set_dirty()
+        self.refresh(media=False)
+        self.select_text_by_id(text_id)
+
+    def _update_text_card(self) -> None:
+        overlay = self.service.text_by_id(self.selected_text_id)
+        self.text_card.setVisible(overlay is not None)
+        if overlay is None:
+            return
+        widgets = (
+            self.text_content, self.text_font, self.text_size,
+            self.text_outline, self.text_x, self.text_y,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.text_content.setText(overlay.text)
+        self.text_font.setCurrentText(overlay.font)
+        self.text_size.setValue(overlay.size_px)
+        self.text_outline.setValue(overlay.outline_px)
+        self.text_x.setValue(overlay.x_px)
+        self.text_y.setValue(overlay.y_px)
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._paint_color_button(self.text_color_button, overlay.color)
+        self._paint_color_button(self.text_outline_color_button, overlay.outline_color)
+
+    @staticmethod
+    def _paint_color_button(button: QPushButton, color: str) -> None:
+        button.setText(color)
+        button.setStyleSheet(
+            f"background: {color}; color: {'#101215' if QColor(color).lightness() > 128 else '#f4f6f9'};"
+        )
+
+    def _pick_text_color(self, field: str) -> None:
+        overlay = self.service.text_by_id(self.selected_text_id)
+        if overlay is None:
+            return
+        chosen = QColorDialog.getColor(QColor(getattr(overlay, field)), self, "Caption colour")
+        if not chosen.isValid():
+            return
+        self._commit_text_change(**{field: chosen.name()})
+
+    def apply_text_properties(self, *_args) -> None:
+        overlay = self.service.text_by_id(self.selected_text_id)
+        if overlay is None:
+            return
+        self._commit_text_change(
+            text=self.text_content.text(),
+            font=self.text_font.currentText(),
+            size_px=self.text_size.value(),
+            outline_px=self.text_outline.value(),
+            x_px=self.text_x.value(),
+            y_px=self.text_y.value(),
+        )
+
+    def _commit_text_change(self, **fields) -> None:
+        if not self.service.update_text(self.selected_text_id, **fields):
+            return
+        self._set_dirty()
+        self._update_text_card()
+        self.timeline_canvas.update()
+        self._refresh_preview_text(force=True)
+
+    def _on_preview_text_moved(self, x_px: int, y_px: int) -> None:
+        """Committed after a drag of the caption in the preview canvas."""
+        if not self._preview_text_id:
+            return
+        if self.service.update_text(self._preview_text_id, x_px=x_px, y_px=y_px):
+            self._set_dirty()
+            self._update_text_card()
+
+    def _active_text_overlay(self):
+        """The caption to show on the canvas: the selected one while editing,
+        otherwise whatever covers the playhead."""
+        overlay = self.service.text_by_id(self.selected_text_id)
+        if overlay is not None:
+            return overlay
+        at_playhead = self.service.texts_at(self.playhead_ms)
+        return at_playhead[-1] if at_playhead else None
+
+    def _refresh_preview_text(self, force: bool = False) -> None:
+        overlay = self._active_text_overlay()
+        overlay_id = overlay.id if overlay is not None else ""
+        # Playback ticks constantly; only touch the scene when it would change.
+        if not force and overlay_id == self._preview_text_id:
+            return
+        self._preview_text_id = overlay_id
+        self.preview_area.set_text(overlay)
 
     def select_relative_clip(self, offset: int) -> None:
         clips = self.service.video_track.clips
@@ -2335,6 +2779,7 @@ class MainWindow(QMainWindow):
         self.playhead_slider.setValue(self.playhead_ms)
         self.timeline_canvas.set_playhead(self.playhead_ms)
         self.update_time_label()
+        self._refresh_preview_text()
 
         clip = self.service.clip_at_timeline(self.playhead_ms)
         if clip is None:
@@ -2469,6 +2914,7 @@ class MainWindow(QMainWindow):
         self.playhead_slider.blockSignals(False)
         self.timeline_canvas.set_playhead(self.playhead_ms)
         self.update_time_label()
+        self._refresh_preview_text()
 
     def on_media_status_changed(self, _status) -> None:
         if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
@@ -2606,7 +3052,7 @@ class MainWindow(QMainWindow):
             hardware_backend=backend,
             width=project.timeline.width,
             height=project.timeline.height,
-            fps=project.timeline.fps,
+            fps=self.export_fps.value(),
             bitrate_kbps=self.bitrate.value(),
             allow_stream_copy=self.allow_stream_copy.isChecked(),
             master_volume=project.timeline.master_volume,
@@ -2660,7 +3106,7 @@ class MainWindow(QMainWindow):
 
         self.export_output_path = str(final_path)
         self.export_temp_path = temporary
-        self._export_expected_fps = project.timeline.fps
+        self._export_expected_fps = profile.fps
         self._export_expected_codec = profile.codec
         self.progress.setValue(0)
         self.export_button.setEnabled(False)
@@ -2744,10 +3190,7 @@ class MainWindow(QMainWindow):
         else:
             msg = f"Export failed with code {code} (see FFmpeg log)"
         if code != 0 and temporary is not None:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+            temporary.unlink(missing_ok=True)
         self.statusBar().showMessage(msg)
         self.command_box.append(msg)
         self.export_temp_path = ""
@@ -2791,12 +3234,8 @@ class MainWindow(QMainWindow):
 def run_app() -> int:
     app = QApplication(sys.argv)
 
-    # Since PySide6 6.5, an unhandled exception inside a Qt slot aborts the
-    # whole process. Log it instead so one bad event can't take down the app.
-    def _excepthook(exc_type, exc_value, exc_tb) -> None:
-        traceback.print_exception(exc_type, exc_value, exc_tb)
-
-    sys.excepthook = _excepthook
+    # Since PySide6 6.5, log unhandled slot exceptions instead of aborting.
+    sys.excepthook = traceback.print_exception
 
     window = MainWindow()
     window.show()
