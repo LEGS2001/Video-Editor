@@ -4,7 +4,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.uv-cache/
 .claude/settings.local.json
+.claude/worktrees/
 build/
 dist/
 *.egg-info/
