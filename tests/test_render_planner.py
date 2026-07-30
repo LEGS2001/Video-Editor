@@ -240,3 +240,32 @@ def test_captions_disable_smart_render_segments():
 
     project.timeline.texts.append(TextOverlay(text="Hello", end_ms=2000))
     assert plan_smart_segments(project, profile, clips, [first, second]) is None
+
+
+def test_fade_forces_reencode_without_falling_back_to_cpu():
+    asset = compatible_asset()
+    clip = Clip(asset_id=asset.id, source_out_ms=asset.duration_ms, fade_in_ms=500)
+
+    plan = build_render_plan(
+        project_with_clip(asset, clip), ExportProfile(output_path="/tmp/out.mp4"), HardwareBackend.NVENC
+    )
+
+    assert plan.route == RenderRoute.REENCODE
+    # A fade is only a filter, so it must not drag in the canvas-transform CPU path.
+    assert plan.backend == HardwareBackend.NVENC
+    assert "fade" in plan.reason
+
+
+def test_faded_clip_is_not_coalesced_into_its_neighbour():
+    asset = compatible_asset()
+    project = Project(media=[asset])
+    # Two halves of one source that would otherwise fuse into a single clip.
+    project.timeline.tracks[0].clips = [
+        Clip(asset_id=asset.id, source_out_ms=2000, fade_in_ms=500),
+        Clip(asset_id=asset.id, source_in_ms=2000, source_out_ms=4000, timeline_start_ms=2000),
+    ]
+
+    plan = build_render_plan(project, ExportProfile(output_path="/tmp/out.mp4"), HardwareBackend.CPU)
+
+    assert len(plan.clips) == 2
+    assert plan.clips[0].fade_in_ms == 500

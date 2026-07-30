@@ -71,6 +71,8 @@ def _clip_to_dict(clip: Clip) -> dict[str, Any]:
         "muted": clip.muted,
         "groupId": clip.group_id,
         "speed": clip.speed,
+        "fadeInMs": str(clip.fade_in_ms),
+        "fadeOutMs": str(clip.fade_out_ms),
     }
 
 
@@ -102,6 +104,8 @@ def _clip_from_dict(data: dict[str, Any]) -> Clip:
         muted=bool(data.get("muted", False)),
         group_id=data.get("groupId", ""),
         speed=float(data.get("speed", 1.0)),
+        fade_in_ms=_int64(data.get("fadeInMs")),
+        fade_out_ms=_int64(data.get("fadeOutMs")),
     )
 
 
@@ -323,6 +327,10 @@ def validate_project(project: Project) -> None:
             crop = clip.crop
             if min(crop.left, crop.top, crop.right, crop.bottom) < 0:
                 raise ValueError(f"Clip {clip.id!r} has negative crop")
+            # Only non-negative is checked: a trim or speed change can legitimately
+            # leave a fade longer than its clip, and the renderer clamps it.
+            if min(clip.fade_in_ms, clip.fade_out_ms) < 0:
+                raise ValueError(f"Clip {clip.id!r} has negative fade")
             if crop.enabled and asset.has_video and (
                 crop.left + crop.right >= asset.width or crop.top + crop.bottom >= asset.height
             ):

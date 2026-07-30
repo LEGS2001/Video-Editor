@@ -249,13 +249,14 @@ class ProjectService:
         clip = self.clip_by_id(clip_id)
         if clip is None:
             return False
-        current = (clip.transform, clip.crop, clip.opacity, clip.volume, clip.speed)
-        reset = (Transform(), Crop(), 1.0, 1.0, 1.0)
+        current = (clip.transform, clip.crop, clip.opacity, clip.volume, clip.speed, clip.fade_in_ms, clip.fade_out_ms)
+        reset = (Transform(), Crop(), 1.0, 1.0, 1.0, 0, 0)
         if current == reset:
             return False
         self.snapshot()
         clip.transform, clip.crop = Transform(), Crop()
         clip.opacity = clip.volume = clip.speed = 1.0
+        clip.fade_in_ms = clip.fade_out_ms = 0
         self.normalize_timeline()
         return True
 

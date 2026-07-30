@@ -17,8 +17,11 @@ Python/PySide6 video editor focused on fast FFmpeg exports. The app keeps the re
 - Preview and play video inside the GUI with PySide6 multimedia.
 - Click the timeline to seek between clips.
 - Drag across the timeline ruler to scrub the playhead in real time; double-click a clip row to jump to its start.
+- See a poster frame on each timeline clip bar, reusing the media bin's cached thumbnail.
 - Split the active clip at the playhead.
 - Trim clips with playhead-based In/Out buttons or one-second nudges.
+- Duplicate a clip with `Ctrl+D`, or copy and paste one with `Ctrl+C` / `Ctrl+V`.
+- Fade a clip in or out, video and audio together; a fade forces a reencode and is clamped to the clip's length.
 - Change video speed from `0.25x` to `100x`; audio keeps its pitch below `4x` and is silent from `4x`.
 - Choose the export frame rate from `1` to `240` FPS; new projects default to `60` FPS and adopt the first video clip's FPS.
 - Undo and Redo up to 30 project states.
@@ -27,6 +30,7 @@ Python/PySide6 video editor focused on fast FFmpeg exports. The app keeps the re
 - Add caption text with a chosen font, size, fill colour, and outline; drag its bar in the timeline's text row to retime it and drag the caption itself in the preview to position it. Captions are burned in on export and force a reencode.
 - Play and pause the preview with `Space`.
 - Navigate by frame with `,` and `.`, jump with `Home`/`End`, and toggle timeline snapping with `N`.
+- Reopen recent projects from `File > Open Recent`, and list every keyboard shortcut with `F1`.
 - Reset timeline-level properties or the selected clip's editable properties from the top toolbar; both operations support Undo.
 - Export untouched compatible clips through FFmpeg stream copy, including compatible container remuxes.
 - Smart-render mixed timelines by copying untouched clips and reencoding only changed clips when their streams can be concatenated safely.
@@ -98,7 +102,7 @@ Tests marked `ffmpeg` are integration tests. CI runs them only when both
 
 - Compatible single clips export with `-c copy`.
 - Compatible multiple clips use FFmpeg concat demuxer with stream copy.
-- Crop, scale, position, opacity, rotation, resolution changes, FPS changes, or incompatible media force reencode.
+- Crop, scale, position, opacity, rotation, fades, resolution changes, FPS changes, or incompatible media force reencode.
 - Any clip whose speed differs from `1x` is reencoded; untouched smart-render segments may still be copied.
 - Auto backend prefers VAAPI, then NVENC, AMF, QSV, and finally CPU.
-- Project files remain JSON version `1`; older files without `speed` load at `1x` and files without `texts` load with no captions.
+- Project files remain JSON version `1`; older files without `speed` load at `1x`, files without `texts` load with no captions, and files without fade fields load with no fades.

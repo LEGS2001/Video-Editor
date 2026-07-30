@@ -101,6 +101,25 @@ def _canvas_place_filters(src_w: int, src_h: int, clip, out_w: int, out_h: int) 
     return filters
 
 
+def _fade_filters(clip, video: bool) -> list[str]:
+    """Fade in from / out to black (or silence), in the clip's own timebase.
+
+    The single clamp point for every render path: a trim or a speed change can
+    leave a fade longer than the clip it belongs to, so the durations are capped
+    here rather than rejected on load. fade_out is capped against what fade_in
+    leaves, which keeps its start non-negative and the two from overlapping."""
+    duration_ms = clip.duration_ms
+    fade_in = min(max(0, clip.fade_in_ms), duration_ms)
+    fade_out = min(max(0, clip.fade_out_ms), duration_ms - fade_in)
+    name = "fade" if video else "afade"
+    filters = []
+    if fade_in > 0:
+        filters.append(f"{name}=t=in:st=0:d={fade_in / 1000:g}")
+    if fade_out > 0:
+        filters.append(f"{name}=t=out:st={(duration_ms - fade_out) / 1000:g}:d={fade_out / 1000:g}")
+    return filters
+
+
 def _clip_software_filters(clip, asset, profile: ExportProfile) -> list[str]:
     """Canonical crop -> rotate -> scale/place -> opacity -> FPS/SAR chain."""
     filters, width, height = _crop_filter(clip, asset)
@@ -119,6 +138,9 @@ def _clip_software_filters(clip, asset, profile: ExportProfile) -> list[str]:
         filters.append(f"colorchannelmixer=rr={opacity:g}:gg={opacity:g}:bb={opacity:g}")
     if abs(clip.speed - 1.0) > 1e-6:
         filters.append(f"setpts=(PTS-STARTPTS)/{clip.speed:g}")
+    # After setpts: the fade keys off timestamps at its position in the chain, so
+    # it has to see post-speed time for clip.duration_ms to be the right basis.
+    filters.extend(_fade_filters(clip, video=True))
     filters.extend([f"fps={profile.fps:g}", "setsar=1"])
     return filters
 
@@ -209,6 +231,7 @@ def _audio_filters(clip, profile: ExportProfile) -> list[str]:
     gain = profile.master_volume * clip.volume
     if abs(gain - 1.0) > 1e-6:
         filters.append(f"volume={gain:.4f}")
+    filters.extend(_fade_filters(clip, video=False))
     return filters
 
 
@@ -262,6 +285,12 @@ def _concat_filter(plan: RenderPlan, profile: ExportProfile, include_audio: bool
             gain = profile.master_volume * clip.volume
             if abs(gain - 1.0) > 1e-6 and clip.speed < 4.0:
                 audio_chain += f",volume={gain:.4f}"
+            # This chain is built inline rather than through _audio_filters, so the
+            # fade has to be appended here too.
+            if asset.has_audio and clip.speed < 4.0:
+                fades = _fade_filters(clip, video=False)
+                if fades:
+                    audio_chain += "," + ",".join(fades)
             audio_chain += f"[a{index}]"
             filters.append(audio_chain)
             concat_inputs.append(f"[a{index}]")

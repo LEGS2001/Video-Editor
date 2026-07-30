@@ -1176,7 +1176,9 @@ class MainWindow(QMainWindow):
         self.reset_timeline_action = QAction("Reset Timeline", self)
         self.reset_timeline_action.setToolTip("Reset canvas, frame rate, and master volume")
         self.reset_clip_action = QAction("Reset Clip", self)
-        self.reset_clip_action.setToolTip("Reset crop, transform, opacity, volume, and speed for the selected clip")
+        self.reset_clip_action.setToolTip(
+            "Reset crop, transform, opacity, fades, volume, and speed for the selected clip"
+        )
         self.delete_action = QAction(_svg_icon("trash"), "Remove", self)
         self.delete_action.setToolTip("Remove the selected clip from the timeline")
         self.previous_clip_action = QAction("Select Previous Clip", self)
@@ -1491,6 +1493,8 @@ class MainWindow(QMainWindow):
         self.rotation = self._spin(-360, 360, suffix="°")
         self.opacity = self._spin(0, 100, suffix=" %")
         self.opacity.setValue(100)
+        self.fade_in = self._spin(0, 60000, suffix=" ms")
+        self.fade_out = self._spin(0, 60000, suffix=" ms")
         self.speed = QDoubleSpinBox()
         self.speed.setRange(0.25, 100.0)
         self.speed.setDecimals(2)
@@ -1527,6 +1531,8 @@ class MainWindow(QMainWindow):
             "Clip position Y": self.pos_y,
             "Clip rotation": self.rotation,
             "Clip opacity": self.opacity,
+            "Clip fade in": self.fade_in,
+            "Clip fade out": self.fade_out,
         }
         for name, widget in editors.items():
             widget.setAccessibleName(name)
@@ -1540,6 +1546,8 @@ class MainWindow(QMainWindow):
         transform_form.addRow(self._field_label("Position Y", self.pos_y), self.pos_y)
         transform_form.addRow(self._field_label("Rotation", self.rotation), self.rotation)
         transform_form.addRow(self._field_label("Opacity", self.opacity), self.opacity)
+        transform_form.addRow(self._field_label("Fade in", self.fade_in), self.fade_in)
+        transform_form.addRow(self._field_label("Fade out", self.fade_out), self.fade_out)
         transform_form.addRow(self._field_label("Speed", self.speed), speed_widget)
 
         self.clip_volume_slider = self._make_volume_slider()
@@ -2569,7 +2577,7 @@ class MainWindow(QMainWindow):
         editors = [
             self.crop_left, self.crop_top, self.crop_right, self.crop_bottom,
             self.scale, self.pos_x, self.pos_y, self.rotation, self.opacity,
-            self.clip_volume_slider, self.speed,
+            self.fade_in, self.fade_out, self.clip_volume_slider, self.speed,
         ]
         for widget in editors:
             widget.blockSignals(True)
@@ -2583,6 +2591,8 @@ class MainWindow(QMainWindow):
         self.pos_y.setValue(int(clip.transform.y))
         self.rotation.setValue(int(round(clip.transform.rotation_deg)))
         self.opacity.setValue(int(round(clip.opacity * 100)))
+        self.fade_in.setValue(clip.fade_in_ms)
+        self.fade_out.setValue(clip.fade_out_ms)
         self.speed.setValue(clip.speed)
         self.clip_volume_slider.setValue(volume_pct)
         self.clip_volume_value.setText(f"{volume_pct}%")
@@ -2613,11 +2623,15 @@ class MainWindow(QMainWindow):
         top, bottom = self.crop_top.value(), self.crop_bottom.value()
         left, right = min(left, max(0, width - 1 - right)), min(right, max(0, width - 1 - left))
         top, bottom = min(top, max(0, height - 1 - bottom)), min(bottom, max(0, height - 1 - top))
-        values = (left, top, right, bottom, self.scale.value(), self.pos_x.value(), self.pos_y.value(), self.rotation.value(), self.opacity.value())
+        values = (
+            left, top, right, bottom, self.scale.value(), self.pos_x.value(), self.pos_y.value(),
+            self.rotation.value(), self.opacity.value(), self.fade_in.value(), self.fade_out.value(),
+        )
         current = (
             clip.crop.left, clip.crop.top, clip.crop.right, clip.crop.bottom,
             int(round(clip.transform.scale_x * 100)), int(round(clip.transform.x)), int(round(clip.transform.y)),
             int(round(clip.transform.rotation_deg)), int(round(clip.opacity * 100)),
+            clip.fade_in_ms, clip.fade_out_ms,
         )
         if values == current:
             return
@@ -2630,6 +2644,8 @@ class MainWindow(QMainWindow):
         clip.transform.y = self.pos_y.value()
         clip.transform.rotation_deg = self.rotation.value()
         clip.opacity = self.opacity.value() / 100.0
+        clip.fade_in_ms = self.fade_in.value()
+        clip.fade_out_ms = self.fade_out.value()
         self._configure_crop_limits(asset, clip)
         self._set_dirty()
         self._refresh_preview_transform()

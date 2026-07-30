@@ -62,6 +62,8 @@ class Clip:
     muted: bool = False
     group_id: str = ""
     speed: float = 1.0
+    fade_in_ms: int = 0
+    fade_out_ms: int = 0
     _timeline_fps: float = field(default=30.0, init=False, repr=False, compare=False)
 
     @property
@@ -84,8 +86,14 @@ class Clip:
         return abs(self.volume - 1.0) > 1e-6
 
     @property
+    def has_fade(self) -> bool:
+        return self.fade_in_ms > 0 or self.fade_out_ms > 0
+
+    @property
     def has_visual_transform(self) -> bool:
-        return self.crop.enabled or self.has_canvas_transform
+        # A fade counts here so that every stream-copy gate rejects it. It is
+        # deliberately not in has_canvas_transform, which forces the CPU backend.
+        return self.crop.enabled or self.has_canvas_transform or self.has_fade
 
     @property
     def has_canvas_transform(self) -> bool:

@@ -322,3 +322,64 @@ def test_drawtext_values_are_escaped():
 
     assert r"text=50%\\: it\\\'s \\\[fine\\\]" in chain
     assert ":expansion=none:" in chain
+
+
+def test_fade_uses_post_speed_duration_and_follows_setpts():
+    asset = MediaAsset(
+        id="a", path="/tmp/in.mp4", video_codec="h264", width=1920, height=1080,
+        duration_ms=4000, has_video=True, has_audio=True,
+    )
+    clip = Clip(asset_id="a", source_out_ms=4000, speed=2.0, fade_in_ms=250, fade_out_ms=500)
+    clip.set_timeline_fps(30.0)
+
+    command = build_ffmpeg_command(_reencode_plan(asset, clip), ExportProfile(output_path="/tmp/out.mp4"))
+    vf = _vf_of(command)
+
+    # The clip plays for 2000ms at 2x, so the fade-out starts at 1.5s — not at
+    # 3.5s, which is what the untouched 4000ms source would give.
+    assert "fade=t=in:st=0:d=0.25" in vf
+    assert "fade=t=out:st=1.5:d=0.5" in vf
+    # It has to sit after setpts, or it sees pre-speed timestamps.
+    assert vf.index("setpts=") < vf.index("fade=t=in")
+    af = command.arguments[command.arguments.index("-af") + 1]
+    assert "afade=t=in:st=0:d=0.25" in af
+    assert "afade=t=out:st=1.5:d=0.5" in af
+
+
+def test_fade_longer_than_its_clip_is_clamped_without_overlapping():
+    asset = MediaAsset(
+        id="a", path="/tmp/in.mp4", video_codec="h264", width=1920, height=1080,
+        duration_ms=1000, has_video=True,
+    )
+    # A trim can leave fades that outlast the clip; the renderer clamps them.
+    clip = Clip(asset_id="a", source_out_ms=1000, fade_in_ms=800, fade_out_ms=900)
+    clip.set_timeline_fps(30.0)
+
+    vf = _vf_of(build_ffmpeg_command(_reencode_plan(asset, clip), ExportProfile(output_path="/tmp/out.mp4")))
+
+    assert "fade=t=in:st=0:d=0.8" in vf
+    # Only the 200ms the fade-in leaves, so the start stays inside the clip.
+    assert "fade=t=out:st=0.8:d=0.2" in vf
+
+
+def test_fade_reaches_the_concat_filtergraph_for_both_streams():
+    asset = MediaAsset(
+        id="a", path="/tmp/in.mp4", video_codec="h264", width=1920, height=1080,
+        duration_ms=4000, has_video=True, has_audio=True,
+    )
+    first = Clip(asset_id="a", source_out_ms=2000, fade_in_ms=500)
+    second = Clip(asset_id="a", source_in_ms=2000, source_out_ms=4000, timeline_start_ms=2000, fade_out_ms=400)
+    for clip in (first, second):
+        clip.set_timeline_fps(30.0)
+
+    graph = _concat_filter(
+        RenderPlan(clips=[first, second], assets=[asset, asset]),
+        ExportProfile(output_path="/tmp/out.mp4"),
+        include_audio=True,
+    )
+
+    assert "fade=t=in:st=0:d=0.5" in graph
+    assert "fade=t=out:st=1.6:d=0.4" in graph
+    # The concat path builds its audio chain inline instead of via _audio_filters.
+    assert "afade=t=in:st=0:d=0.5" in graph
+    assert "afade=t=out:st=1.6:d=0.4" in graph

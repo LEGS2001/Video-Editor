@@ -232,7 +232,7 @@ def build_render_plan(project: Project, profile: ExportProfile, resolved_backend
     if plan.clip.has_visual_transform:
         if plan.clip.has_canvas_transform:
             plan.backend = HardwareBackend.CPU
-        plan.reason = "Crop, scale, position, rotation, or opacity requires reencode"
+        plan.reason = "Crop, scale, position, rotation, opacity, or fade requires reencode"
         return plan
     if not _codec_matches(plan.asset, profile.codec):
         plan.reason = "Output codec differs from source"
