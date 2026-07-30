@@ -2291,7 +2291,7 @@ class MainWindow(QMainWindow):
         ("N", "Toggle timeline snapping"),
     )
 
-    def show_shortcuts(self) -> None:
+    def _shortcuts_html(self) -> str:
         """Derived from the actions themselves, so the list cannot drift."""
         rows = [
             (action.shortcut().toString(), action.text())
@@ -2302,7 +2302,16 @@ class MainWindow(QMainWindow):
         body = "".join(
             f"<tr><td><b>{key}</b>&nbsp;&nbsp;</td><td>{label}</td></tr>" for key, label in rows
         )
-        QMessageBox.information(self, "Keyboard Shortcuts", f"<table>{body}</table>")
+        return f"<table>{body}</table>"
+
+    def show_shortcuts(self) -> None:
+        # NoIcon rather than QMessageBox.information: the icon is what carries the
+        # system alert sound on Windows, and a reference list is not an alert.
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.NoIcon)
+        box.setWindowTitle("Keyboard Shortcuts")
+        box.setText(self._shortcuts_html())
+        box.exec()
 
     def _recent_projects(self) -> list[str]:
         # Newline-joined rather than a QStringList: a one-element list does not
