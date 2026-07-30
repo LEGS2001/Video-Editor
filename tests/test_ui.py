@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsRectItem,
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
 import pytest
 
 from video_editor import ui
+from video_editor.media import thumbnail_path
 from video_editor.models import Clip, MediaAsset, Project, Transform, VideoCodec
 from video_editor.recovery import RecoveryService
 from video_editor.ui import MainWindow, _format_ms
@@ -738,3 +740,38 @@ def test_space_toggles_playback_but_not_while_typing_a_caption(window, qtbot):
     window.timeline_canvas.setFocus()
     qtbot.keyClick(window, Qt.Key.Key_Space)
     assert window.player.playbackState() == _PlayerStub.PlaybackState.PlayingState
+
+
+def test_clip_bar_thumbnail_cache_is_populated_and_cleared(window, tmp_path):
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    canvas = window.timeline_canvas
+    # The real cache dir is shared across runs; keep this test hermetic.
+    canvas.cache_dir = tmp_path / "thumbs"
+    canvas.thumbnails.clear()
+    canvas.resize(900, canvas.height())
+
+    canvas.grab()  # forces a synchronous paintEvent
+
+    # No poster frame exists on disk, so the miss must still be cached — otherwise
+    # every repaint during a drag re-stats the file.
+    asset_id = window.service.video_track.clips[0].asset_id
+    assert asset_id in canvas.thumbnails
+    assert canvas.thumbnails[asset_id].isNull()
+
+    window.refresh(media=True)
+    assert not canvas.thumbnails
+
+    # With a poster frame on disk it is cached already scaled to the bar height,
+    # so a repaint never rescales the 320px original.
+    asset = window.service.asset_by_id(asset_id)
+    source = thumbnail_path(asset, canvas.cache_dir)
+    source.parent.mkdir(parents=True, exist_ok=True)
+    poster = QPixmap(320, 180)
+    poster.fill(Qt.GlobalColor.red)
+    assert poster.save(str(source))
+
+    canvas.grab()
+
+    assert canvas.thumbnails[asset_id].height() == canvas.THUMB_HEIGHT
+    assert canvas.thumbnails[asset_id].width() == 64

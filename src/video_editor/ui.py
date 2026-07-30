@@ -500,13 +500,19 @@ class TimelineCanvas(QWidget):
     RULER_BOTTOM = 50
     EDGE_HIT_PX = 6
     MIN_CLIP_MS = 100
+    THUMB_HEIGHT = 36
     ZOOM_MIN = 1.0
     ZOOM_MAX = 200.0
     TICK_CANDIDATES_MS = (100, 250, 500, 1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000, 300000, 600000, 1800000, 3600000)
 
-    def __init__(self, service: ProjectService) -> None:
+    def __init__(self, service: ProjectService, cache_dir: Path) -> None:
         super().__init__()
         self.service = service
+        self.cache_dir = cache_dir
+        # Scaled poster frames keyed by asset id. paintEvent runs on every mouse
+        # move during a drag, so misses are cached too (as a null pixmap) and a
+        # missing file is never re-stat'd per frame. Cleared on a media refresh.
+        self.thumbnails: dict[str, QPixmap] = {}
         self.selected_clip_id = ""
         self.selected_text_id = ""
         self.active_text_id = ""
@@ -527,6 +533,17 @@ class TimelineCanvas(QWidget):
         self.snap_enabled = True
         self.setMinimumHeight(152)
         self.setMouseTracking(True)
+
+    def _thumbnail(self, asset) -> QPixmap:
+        cached = self.thumbnails.get(asset.id)
+        if cached is not None:
+            return cached
+        source = thumbnail_path(asset, self.cache_dir)
+        pixmap = QPixmap(str(source)) if source.exists() else QPixmap()
+        if not pixmap.isNull():
+            pixmap = pixmap.scaledToHeight(self.THUMB_HEIGHT, Qt.TransformationMode.SmoothTransformation)
+        self.thumbnails[asset.id] = pixmap
+        return pixmap
 
     def set_selection(self, clip_id: str, text_id: str = "") -> None:
         self.selected_clip_id = clip_id
@@ -662,9 +679,24 @@ class TimelineCanvas(QWidget):
             painter.drawRoundedRect(QRectF(rect.left() + 1, rect.top() + 1, max(2.0, rect.width() - 2), 4), 2, 2)
 
             asset = self.service.asset_by_id(clip.asset_id)
+            label_rect = rect.adjusted(10, 8, -10, -4)
+            thumb = self._thumbnail(asset) if asset else QPixmap()
+            # Only worth it when the bar is wide enough to leave room for the name.
+            if not thumb.isNull() and rect.width() >= thumb.width() + 48:
+                painter.save()
+                clip_path = QPainterPath()
+                clip_path.addRoundedRect(rect, 6, 6)
+                painter.setClipPath(clip_path)
+                painter.drawPixmap(
+                    QPointF(rect.left() + 1, rect.top() + (self.LANE_HEIGHT - thumb.height()) / 2 + 2),
+                    thumb,
+                )
+                painter.restore()
+                label_rect = rect.adjusted(thumb.width() + 8, 8, -10, -4)
+
             label = Path(asset.path).name if asset else "Missing media"
             painter.setPen(QColor("#f4f6f9" if selected else TEXT))
-            painter.drawText(rect.adjusted(10, 8, -10, -4), Qt.AlignmentFlag.AlignVCenter, label)
+            painter.drawText(label_rect, Qt.AlignmentFlag.AlignVCenter, label)
 
         for overlay in self.service.texts:
             start_ms, end_ms = overlay.start_ms, overlay.end_ms
@@ -1349,7 +1381,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(controls)
 
         card, timeline_layout = self._card("Timeline")
-        self.timeline_canvas = TimelineCanvas(self.service)
+        self.timeline_canvas = TimelineCanvas(self.service, self.cache_dir)
         self.timeline_canvas.set_snapping(self.snap_action.isChecked())
         self.timeline_canvas.setAccessibleName("Visual timeline")
         self.timeline_canvas.clip_selected.connect(self.select_clip_by_id)
@@ -2051,6 +2083,9 @@ class MainWindow(QMainWindow):
         # timeline-only edits (split/trim/move) so playback video never stalls
         # mid-frame — a stall there desyncs the audio that keeps draining.
         if media:
+            # Media changed, so a relinked or newly imported asset may have a
+            # different poster frame on disk than the one the canvas cached.
+            self.timeline_canvas.thumbnails.clear()
             # Rebuild silently: clear() would otherwise emit selection changes
             # that reset the user's current media selection mid-refresh.
             self.media_list.blockSignals(True)
