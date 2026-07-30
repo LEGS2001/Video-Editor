@@ -1066,6 +1066,8 @@ class ImportWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    MAX_RECENT = 8
+
     def __init__(self) -> None:
         super().__init__()
         self.service = ProjectService(Project())
@@ -1247,6 +1249,14 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addAction(self.reset_timeline_action)
         toolbar.addAction(self.reset_clip_action)
+
+        file_menu = self.menuBar().addMenu("File")
+        for action in [self.new_action, self.open_action, self.save_action]:
+            file_menu.addAction(action)
+        self.recent_menu = file_menu.addMenu("Open Recent")
+        self.recent_menu.setToolTipsVisible(True)
+        # Rebuilt on demand: files can disappear between openings of the menu.
+        self.recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
 
         media_menu = self.menuBar().addMenu("Media")
         media_menu.addAction(self.import_action)
@@ -2209,27 +2219,33 @@ class MainWindow(QMainWindow):
 
     def open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open Project", "", "Video Editor Project (*.json)")
-        if not path:
-            return
+        if path:
+            self._load_project_path(path)
+
+    def _load_project_path(self, path: str) -> bool:
+        """Shared by Open and the recent-projects list. Loading happens before the
+        unsaved-changes prompt on purpose: a file that fails to load never nags."""
         try:
             project = load_project(path)
         except Exception as exc:
             QMessageBox.critical(self, "Open failed", f"The project was not changed.\n\n{exc}")
-            return
+            return False
         if not self._confirm_unsaved_changes():
-            return
+            return False
         self._stop_import_worker()
         self.service.set_project(project)
         self.current_project_path = Path(path)
         self._saved_fingerprint = self._project_fingerprint()
         self._set_dirty(False)
         self._reset_editor_state()
+        self._remember_recent(self.current_project_path)
         missing = [asset.path for asset in project.media if not Path(asset.path).is_file()]
         if missing:
             shown = "\n".join(missing[:5])
             suffix = f"\n…and {len(missing) - 5} more" if len(missing) > 5 else ""
             QMessageBox.warning(self, "Missing media", f"Some media files could not be found:\n\n{shown}{suffix}")
         self._start_import_worker(assets=[asset for asset in project.media if Path(asset.path).is_file()])
+        return True
 
     def save_project(self) -> bool:
         path = str(self.current_project_path or "")
@@ -2249,8 +2265,29 @@ class MainWindow(QMainWindow):
         self._saved_fingerprint = self._project_fingerprint()
         self.recovery_service.clear(self.service.project.id)
         self._set_dirty(False)
+        self._remember_recent(target)
         self.statusBar().showMessage(f"Saved {target}")
         return True
+
+    def _recent_projects(self) -> list[str]:
+        # Newline-joined rather than a QStringList: a one-element list does not
+        # round-trip the same way across QSettings backends.
+        stored = self.settings.value("project/recent", "", type=str)
+        return [entry for entry in stored.split("\n") if entry]
+
+    def _remember_recent(self, path: Path) -> None:
+        entry = str(path.resolve())
+        kept = [entry, *[other for other in self._recent_projects() if other != entry]]
+        self.settings.setValue("project/recent", "\n".join(kept[: self.MAX_RECENT]))
+
+    def _rebuild_recent_menu(self) -> None:
+        self.recent_menu.clear()
+        existing = [entry for entry in self._recent_projects() if Path(entry).is_file()]
+        for entry in existing:
+            action = self.recent_menu.addAction(Path(entry).name)
+            action.setToolTip(entry)
+            action.triggered.connect(lambda _checked=False, path=entry: self._load_project_path(path))
+        self.recent_menu.setEnabled(bool(existing))
 
     def _confirm_unsaved_changes(self) -> bool:
         if not self.dirty:

@@ -821,3 +821,46 @@ def test_pasting_media_absent_from_the_project_warns_instead_of_dangling(window,
 
     assert warned == ["Paste failed"]
     assert not window.service.video_track.clips
+
+
+def test_recent_projects_records_saves_and_reopens_them(window, tmp_path):
+    previous = window.settings.value("project/recent", "", type=str)
+    try:
+        window.settings.setValue("project/recent", "")
+        target = tmp_path / "demo.json"
+        window.current_project_path = target
+        assert window.save_project()
+
+        assert window._recent_projects() == [str(target.resolve())]
+
+        # A stale entry is hidden by the menu rebuild rather than reopened.
+        window.settings.setValue("project/recent", "\n".join([str(tmp_path / "gone.json"), str(target.resolve())]))
+        window._rebuild_recent_menu()
+        assert [action.text() for action in window.recent_menu.actions()] == ["demo.json"]
+
+        window.new_project()
+        assert window.current_project_path is None
+        assert window._load_project_path(str(target))
+        assert window.current_project_path == target
+    finally:
+        window.settings.setValue("project/recent", previous)
+
+
+def test_recent_projects_keeps_most_recent_first_and_caps_the_list(window, tmp_path):
+    previous = window.settings.value("project/recent", "", type=str)
+    try:
+        window.settings.setValue("project/recent", "")
+        for index in range(window.MAX_RECENT + 2):
+            window._remember_recent(tmp_path / f"p{index}.json")
+
+        recent = window._recent_projects()
+        assert len(recent) == window.MAX_RECENT
+        assert recent[0] == str((tmp_path / f"p{window.MAX_RECENT + 1}.json").resolve())
+
+        # Re-saving an existing project moves it back to the top without duplicating.
+        window._remember_recent(tmp_path / "p5.json")
+        recent = window._recent_projects()
+        assert recent[0] == str((tmp_path / "p5.json").resolve())
+        assert len(recent) == len(set(recent))
+    finally:
+        window.settings.setValue("project/recent", previous)
