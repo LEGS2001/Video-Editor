@@ -104,13 +104,10 @@ def _canvas_place_filters(src_w: int, src_h: int, clip, out_w: int, out_h: int) 
 def _fade_filters(clip, video: bool) -> list[str]:
     """Fade in from / out to black (or silence), in the clip's own timebase.
 
-    The single clamp point for every render path: a trim or a speed change can
-    leave a fade longer than the clip it belongs to, so the durations are capped
-    here rather than rejected on load. fade_out is capped against what fade_in
-    leaves, which keeps its start non-negative and the two from overlapping."""
+    Durations come from Clip.fade_bounds so the preview and the export agree on
+    what an over-long fade means."""
     duration_ms = clip.duration_ms
-    fade_in = min(max(0, clip.fade_in_ms), duration_ms)
-    fade_out = min(max(0, clip.fade_out_ms), duration_ms - fade_in)
+    fade_in, fade_out = clip.fade_bounds()
     name = "fade" if video else "afade"
     filters = []
     if fade_in > 0:

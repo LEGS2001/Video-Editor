@@ -494,6 +494,9 @@ def test_table_single_click_selects_and_double_click_seeks_clip_start(window, qt
     assert window.selected_clip_id == second.id
     assert window.playhead_ms == 0
 
+    # Selecting scrolls the row into view, so the position has to be re-read or the
+    # second click can land on whatever moved under the stale one.
+    position = window.timeline_table.visualItemRect(window.timeline_table.item(1, 1)).center()
     qtbot.mouseDClick(window.timeline_table.viewport(), Qt.MouseButton.LeftButton, pos=position)
     assert window.selected_clip_id == second.id
     assert window.playhead_ms == second.timeline_start_ms
@@ -887,3 +890,52 @@ def test_shortcut_sheet_carries_no_alert_icon(window, monkeypatch):
     # The icon is what plays the Windows system sound; a reference list is not an alert.
     assert shown[0].icon() == QMessageBox.Icon.NoIcon
     assert shown[0].windowTitle() == "Keyboard Shortcuts"
+
+
+def test_audio_row_sits_between_the_lanes_and_is_not_interactive(window, qtbot):
+    canvas = window.timeline_canvas
+    # The audio row is read-only by geometry: it lives outside every hit-test range.
+    assert canvas.LANE_TOP + canvas.LANE_HEIGHT <= canvas.AUDIO_LANE_TOP
+    assert canvas.AUDIO_LANE_TOP + canvas.AUDIO_LANE_HEIGHT <= canvas.TEXT_LANE_TOP
+
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    canvas.resize(900, canvas.height())
+    canvas.grab()  # paints both rows
+
+    qtbot.mouseClick(canvas, Qt.MouseButton.LeftButton, pos=QPoint(200, canvas.AUDIO_LANE_TOP + 10))
+
+    assert canvas.mode == "idle"
+    assert canvas.active_clip_id == ""
+
+
+def test_preview_dims_with_the_fade_at_the_playhead(window):
+    project = _project_with_two_clips()
+    clip = project.timeline.tracks[0].clips[0]
+    clip.fade_in_ms = 500
+    clip.fade_out_ms = 200
+    window.service.set_project(project)
+    window.refresh()
+    frame = window.preview_area.clip_frame
+
+    window.seek_timeline(0)
+    assert frame.opacity() == pytest.approx(0.0)
+    window.seek_timeline(250)
+    assert frame.opacity() == pytest.approx(0.5)
+    window.seek_timeline(600)
+    assert frame.opacity() == pytest.approx(1.0)
+    # 100ms from the end, halfway through a 200ms fade out.
+    window.seek_timeline(900)
+    assert frame.opacity() == pytest.approx(0.5)
+
+
+def test_preview_fade_multiplies_into_clip_opacity_and_matches_the_renderer():
+    clip = Clip(asset_id="a", source_out_ms=1000, fade_in_ms=800, fade_out_ms=900)
+    clip.set_timeline_fps(30.0)
+
+    # The clamp is shared with ffmpeg._fade_filters, so an over-long pair agrees.
+    assert clip.fade_bounds() == (800, 200)
+    assert clip.fade_factor_at(400) == pytest.approx(0.5)
+    assert clip.fade_factor_at(900) == pytest.approx(0.5)
+    assert clip.fade_factor_at(-50) == pytest.approx(0.0)
+    assert clip.fade_factor_at(5000) == pytest.approx(0.0)

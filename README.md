@@ -18,10 +18,11 @@ Python/PySide6 video editor focused on fast FFmpeg exports. The app keeps the re
 - Click the timeline to seek between clips.
 - Drag across the timeline ruler to scrub the playhead in real time; double-click a clip row to jump to its start.
 - See a poster frame on each timeline clip bar, reusing the media bin's cached thumbnail.
+- Read the timeline as separate video and audio rows; the audio row mirrors each clip's span and is outlined when the media has no audio track.
 - Split the active clip at the playhead.
 - Trim clips with playhead-based In/Out buttons or one-second nudges.
 - Duplicate a clip with `Ctrl+D`, or copy and paste one with `Ctrl+C` / `Ctrl+V`.
-- Fade a clip in or out, video and audio together; a fade forces a reencode and is clamped to the clip's length.
+- Fade a clip in or out, video and audio together, and watch the fade dim the preview as the playhead crosses it; a fade forces a reencode and is clamped to the clip's length.
 - Change video speed from `0.25x` to `100x`; audio keeps its pitch below `4x` and is silent from `4x`.
 - Choose the export frame rate from `1` to `240` FPS; new projects default to `60` FPS and adopt the first video clip's FPS.
 - Undo and Redo up to 30 project states.

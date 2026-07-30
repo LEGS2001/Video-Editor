@@ -330,6 +330,7 @@ class PreviewArea(QWidget):
         self.scene.addItem(self.clip_frame)
         # A scene-level sibling, not a child of clip_frame: captions must not
         # inherit the clip's crop, scale or rotation.
+        self._base_opacity = 1.0
         self.text_item = _PreviewTextItem()
         self.scene.addItem(self.text_item)
         self.text_item.snapped = self._show_centre_guides
@@ -363,10 +364,11 @@ class PreviewArea(QWidget):
         self.centre_guides[0].setVisible(x_snapped)
         self.centre_guides[1].setVisible(y_snapped)
 
-    def apply_clip(self, asset, clip) -> None:
+    def apply_clip(self, asset, clip, fade: float = 1.0) -> None:
         """Mirror the clip's crop/scale/position on the canvas; a bare asset
         (or a clip without transforms) is aspect-fit and centered, matching
-        the letterboxed export path."""
+        the letterboxed export path. fade is the playhead's fade multiplier,
+        which multiplies into the clip opacity exactly as the export does."""
         width = asset.width if asset is not None and asset.width > 0 else self.canvas_width
         height = asset.height if asset is not None and asset.height > 0 else self.canvas_height
         crop = clip.crop if clip is not None and clip.crop.enabled else None
@@ -394,7 +396,14 @@ class PreviewArea(QWidget):
         self.clip_frame.setTransform(QTransform.fromScale(scale_x, scale_y))
         self.clip_frame.setPos(offset)
         self.clip_frame.setRotation(clip.transform.rotation_deg if clip is not None else 0.0)
-        self.clip_frame.setOpacity(max(0.0, min(1.0, clip.opacity if clip is not None else 1.0)))
+        self._base_opacity = clip.opacity if clip is not None else 1.0
+        self.set_fade(fade)
+
+    def set_fade(self, fade: float) -> None:
+        """Update the fade multiplier alone. Geometry is left untouched, so this is
+        cheap enough to call on every playback position change."""
+        opacity = self._base_opacity * max(0.0, min(1.0, fade))
+        self.clip_frame.setOpacity(max(0.0, min(1.0, opacity)))
 
     def set_text(self, overlay) -> None:
         """Show one caption on the canvas, styled to match the drawtext export."""
@@ -494,7 +503,13 @@ class TimelineCanvas(QWidget):
     MARGIN = 14
     LANE_TOP = 56
     LANE_HEIGHT = 48
-    TEXT_LANE_TOP = 108
+    # Audio mirrors the video clips rather than being editable, so it sits between
+    # the video and text lanes and is deliberately outside every hit-test range.
+    # Kept slim, and the gaps tightened to 4px, so adding it costs the timeline
+    # table as little height as possible.
+    AUDIO_LANE_TOP = 108
+    AUDIO_LANE_HEIGHT = 16
+    TEXT_LANE_TOP = 128
     TEXT_LANE_HEIGHT = 24
     RULER_TOP = 24
     RULER_BOTTOM = 50
@@ -531,7 +546,7 @@ class TimelineCanvas(QWidget):
         self.pan_anchor_x = 0.0
         self.pan_anchor_offset_ms = 0
         self.snap_enabled = True
-        self.setMinimumHeight(152)
+        self.setMinimumHeight(170)
         self.setMouseTracking(True)
 
     def _thumbnail(self, asset) -> QPixmap:
@@ -621,6 +636,9 @@ class TimelineCanvas(QWidget):
             QRectF(self.MARGIN, self.LANE_TOP, self._content_width(), self.LANE_HEIGHT), 6, 6
         )
         painter.drawRoundedRect(
+            QRectF(self.MARGIN, self.AUDIO_LANE_TOP, self._content_width(), self.AUDIO_LANE_HEIGHT), 6, 6
+        )
+        painter.drawRoundedRect(
             QRectF(self.MARGIN, self.TEXT_LANE_TOP, self._content_width(), self.TEXT_LANE_HEIGHT), 6, 6
         )
 
@@ -697,6 +715,25 @@ class TimelineCanvas(QWidget):
             label = Path(asset.path).name if asset else "Missing media"
             painter.setPen(QColor("#f4f6f9" if selected else TEXT))
             painter.drawText(label_rect, Qt.AlignmentFlag.AlignVCenter, label)
+
+            # Audio row: the same span as the video bar, so it tracks drags and
+            # trims without any geometry of its own.
+            audio_rect = QRectF(rect.left(), self.AUDIO_LANE_TOP, rect.width(), self.AUDIO_LANE_HEIGHT)
+            if asset is not None and asset.has_audio:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor("#3c5a86" if selected else "#2b3038"))
+                painter.drawRoundedRect(audio_rect, 4, 4)
+                # A centre line reads as an audio track without pretending to be a
+                # waveform, which would need per-clip sample analysis.
+                painter.setPen(QPen(QColor("#8fa6c4" if selected else "#5d6675"), 1))
+                middle = audio_rect.center().y()
+                painter.drawLine(
+                    QPointF(audio_rect.left() + 4, middle), QPointF(audio_rect.right() - 4, middle)
+                )
+            else:
+                painter.setPen(QPen(QColor(BORDER), 1, Qt.PenStyle.DashLine))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(audio_rect, 4, 4)
 
         for overlay in self.service.texts:
             start_ms, end_ms = overlay.start_ms, overlay.end_ms
@@ -2114,7 +2151,14 @@ class MainWindow(QMainWindow):
             asset = self.service.asset_by_id(clip.asset_id)
         else:
             asset = self.service.asset_by_id(self.selected_asset_id)
-        self.preview_area.apply_clip(asset, clip)
+        self.preview_area.apply_clip(asset, clip, fade=self._preview_fade(clip))
+
+    def _preview_fade(self, clip) -> float:
+        """The clip's fade multiplier at the playhead, so the preview dims in step
+        with what the export will render."""
+        if clip is None or not clip.has_fade:
+            return 1.0
+        return clip.fade_factor_at(self.playhead_ms - clip.timeline_start_ms)
 
     def refresh(self, media: bool = True) -> None:
         # Rebuilding the media bin re-reads thumbnails from disk. Skip it for
@@ -3099,6 +3143,9 @@ class MainWindow(QMainWindow):
         self.timeline_canvas.set_playhead(self.playhead_ms)
         self.update_time_label()
         self._refresh_preview_text()
+        # Opacity only — the geometry has not moved, so this stays cheap at every
+        # position tick.
+        self.preview_area.set_fade(self._preview_fade(clip))
 
     def on_media_status_changed(self, _status) -> None:
         if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:

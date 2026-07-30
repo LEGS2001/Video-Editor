@@ -89,6 +89,28 @@ class Clip:
     def has_fade(self) -> bool:
         return self.fade_in_ms > 0 or self.fade_out_ms > 0
 
+    def fade_bounds(self) -> tuple[int, int]:
+        """Fade durations clamped to what the clip can actually hold. A trim or a
+        speed change can leave a fade longer than its clip, so this is the single
+        definition shared by the renderer and the preview — fade out is capped
+        against whatever fade in leaves, so the two never overlap."""
+        duration_ms = self.duration_ms
+        fade_in = min(max(0, self.fade_in_ms), duration_ms)
+        return fade_in, min(max(0, self.fade_out_ms), duration_ms - fade_in)
+
+    def fade_factor_at(self, offset_ms: int) -> float:
+        """Brightness multiplier this many ms into the clip, 0.0-1.0."""
+        fade_in, fade_out = self.fade_bounds()
+        offset_ms = max(0, min(offset_ms, self.duration_ms))
+        factor = 1.0
+        if fade_in > 0 and offset_ms < fade_in:
+            factor = offset_ms / fade_in
+        if fade_out > 0:
+            remaining = self.duration_ms - offset_ms
+            if remaining < fade_out:
+                factor = min(factor, max(0.0, remaining) / fade_out)
+        return max(0.0, min(1.0, factor))
+
     @property
     def has_visual_transform(self) -> bool:
         # A fade counts here so that every stream-copy gate rejects it. It is
