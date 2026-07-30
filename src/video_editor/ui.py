@@ -89,7 +89,7 @@ from PySide6.QtWidgets import (
 from .ffmpeg import FONT_FILES, build_ffmpeg_command, build_smart_render_commands
 from .hardware import choose_backend, detect_hardware_cached, supported_backends_for_platform
 from .media import create_thumbnail, probe_media, thumbnail_path
-from .models import ExportProfile, HardwareBackend, Project, RenderRoute, Timeline, Track, TrackType, VideoCodec
+from .models import Clip, ExportProfile, HardwareBackend, Project, RenderRoute, Timeline, Track, TrackType, VideoCodec
 from .project_io import load_project, project_to_dict, save_project
 from .project_service import ProjectService
 from .recovery import RecoveryService
@@ -1074,6 +1074,7 @@ class MainWindow(QMainWindow):
         self.selected_clip_id = ""
         self.selected_text_id = ""
         self._preview_text_id = ""
+        self._clip_clipboard: Clip | None = None
         self.playing_clip_id = ""
         self.playhead_ms = 0
         self.ignore_player_position = False
@@ -1180,6 +1181,12 @@ class MainWindow(QMainWindow):
         self.next_clip_action = QAction("Select Next Clip", self)
         self.move_clip_left_action = QAction("Move Clip Left", self)
         self.move_clip_right_action = QAction("Move Clip Right", self)
+        self.duplicate_action = QAction("Duplicate Clip", self)
+        self.duplicate_action.setToolTip("Insert a copy of the selected clip right after it")
+        self.copy_action = QAction("Copy Clip", self)
+        self.copy_action.setToolTip("Copy the selected clip")
+        self.paste_action = QAction("Paste Clip", self)
+        self.paste_action.setToolTip("Paste the copied clip after the selected one")
 
         self.new_action.setShortcut("Ctrl+N")
         self.open_action.setShortcut("Ctrl+O")
@@ -1193,6 +1200,9 @@ class MainWindow(QMainWindow):
         self.next_clip_action.setShortcut("Alt+Down")
         self.move_clip_left_action.setShortcut("Alt+Left")
         self.move_clip_right_action.setShortcut("Alt+Right")
+        self.duplicate_action.setShortcut("Ctrl+D")
+        self.copy_action.setShortcut("Ctrl+C")
+        self.paste_action.setShortcut("Ctrl+V")
 
         self.new_action.triggered.connect(self.new_project)
         self.open_action.triggered.connect(self.open_project)
@@ -1210,9 +1220,13 @@ class MainWindow(QMainWindow):
         self.next_clip_action.triggered.connect(lambda: self.select_relative_clip(1))
         self.move_clip_left_action.triggered.connect(lambda: self.move_selected_clip(-1))
         self.move_clip_right_action.triggered.connect(lambda: self.move_selected_clip(1))
+        self.duplicate_action.triggered.connect(self.duplicate_selected_clip)
+        self.copy_action.triggered.connect(self.copy_selected_clip)
+        self.paste_action.triggered.connect(self.paste_clip)
         self.addActions([
             self.previous_clip_action, self.next_clip_action,
             self.move_clip_left_action, self.move_clip_right_action,
+            self.duplicate_action, self.copy_action, self.paste_action,
         ])
 
         toolbar = QToolBar("Main")
@@ -2380,6 +2394,46 @@ class MainWindow(QMainWindow):
         self._set_dirty()
         self.select_clip_by_id(clip.id, seek=True)
 
+    def duplicate_selected_clip(self) -> None:
+        if not self.selected_clip_id:
+            return
+        copy = self.service.duplicate_clip(self.selected_clip_id)
+        if copy is None:
+            return
+        self._after_clip_inserted(copy, "Clip duplicated")
+
+    def copy_selected_clip(self) -> None:
+        clip = self.service.clip_by_id(self.selected_clip_id) if self.selected_clip_id else None
+        if clip is None:
+            return
+        self._clip_clipboard = deepcopy(clip)
+        self.statusBar().showMessage("Clip copied — Ctrl+V pastes it after the selected clip")
+
+    def paste_clip(self) -> None:
+        if self._clip_clipboard is None:
+            return
+        # The clipboard outlives the project it was filled from, so its media may
+        # not be in this one; pasting anyway would leave a dangling asset_id.
+        if self.service.asset_by_id(self._clip_clipboard.asset_id) is None:
+            QMessageBox.warning(
+                self,
+                "Paste failed",
+                "The copied clip's media is not in this project. Import it first, then paste.",
+            )
+            return
+        self._after_clip_inserted(
+            self.service.insert_clip_copy(self._clip_clipboard, self.selected_clip_id),
+            "Clip pasted",
+        )
+
+    def _after_clip_inserted(self, clip, message: str) -> None:
+        # refresh before selecting: _set_selection walks timeline_table rows, so
+        # the new clip needs its row to exist for the highlight to stick.
+        self.refresh(media=False)
+        self._set_dirty()
+        self.select_clip_by_id(clip.id, seek=True)
+        self.statusBar().showMessage(message)
+
     def select_clip(self) -> None:
         items = self.timeline_table.selectedItems()
         self._set_selection(clip_id=items[0].data(Qt.ItemDataRole.UserRole) if items else "")
@@ -2761,6 +2815,12 @@ class MainWindow(QMainWindow):
             return
         self.service.snapshot()
         clips[index], clips[target] = clips[target], clips[index]
+        # normalize_timeline sorts on timeline_start_ms, so swapping only the list
+        # positions would let the sort put them straight back.
+        clips[index].timeline_start_ms, clips[target].timeline_start_ms = (
+            clips[target].timeline_start_ms,
+            clips[index].timeline_start_ms,
+        )
         self.service.normalize_timeline()
         self._set_dirty()
         self.refresh(media=False)

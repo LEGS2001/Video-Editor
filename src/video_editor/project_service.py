@@ -127,6 +127,25 @@ class ProjectService:
             return True
         return False
 
+    def insert_clip_copy(self, source: Clip, after_clip_id: str) -> Clip:
+        """Insert a copy of source just after after_clip_id, or at the end of the
+        timeline when that clip is not on it. Backs both duplicate and paste."""
+        track = self._ensure_video_track()
+        index = next((i for i, clip in enumerate(track.clips) if clip.id == after_clip_id), -1)
+        self.snapshot()
+        copy = deepcopy(source)
+        copy.id = uuid4().hex
+        # normalize_timeline sorts on timeline_start_ms before repacking, so the
+        # copy has to carry the anchor's start or the sort moves it elsewhere.
+        copy.timeline_start_ms = track.clips[index].timeline_start_ms if index >= 0 else self.timeline_duration_ms()
+        track.clips.insert(index + 1 if index >= 0 else len(track.clips), copy)
+        self.normalize_timeline()
+        return copy
+
+    def duplicate_clip(self, clip_id: str) -> Clip | None:
+        clip = self.clip_by_id(clip_id)
+        return None if clip is None else self.insert_clip_copy(clip, clip_id)
+
     def move_clip(self, clip_id: str, new_timeline_start_ms: int) -> bool:
         track = self._ensure_video_track()
         target = next((clip for clip in track.clips if clip.id == clip_id), None)

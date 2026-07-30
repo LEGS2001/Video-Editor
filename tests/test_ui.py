@@ -775,3 +775,49 @@ def test_clip_bar_thumbnail_cache_is_populated_and_cleared(window, tmp_path):
 
     assert canvas.thumbnails[asset_id].height() == canvas.THUMB_HEIGHT
     assert canvas.thumbnails[asset_id].width() == 64
+
+
+def test_alt_arrow_actually_reorders_the_clip(window):
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    first, second = (clip.id for clip in window.service.video_track.clips)
+    window.select_clip_by_id(first)
+
+    window.move_selected_clip(1)
+
+    # Swapping list positions alone is a no-op: normalize_timeline sorts on
+    # timeline_start_ms and would put them straight back.
+    assert [clip.id for clip in window.service.video_track.clips] == [second, first]
+
+    window.move_selected_clip(-1)
+    assert [clip.id for clip in window.service.video_track.clips] == [first, second]
+
+
+def test_copy_and_paste_a_clip_through_the_actions(window):
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    first = window.service.video_track.clips[0].id
+    window.select_clip_by_id(first)
+
+    window.copy_selected_clip()
+    window.paste_clip()
+
+    clips = window.service.video_track.clips
+    assert len(clips) == 3
+    assert clips[1].id == window.selected_clip_id != first
+    assert clips[1].asset_id == clips[0].asset_id
+
+
+def test_pasting_media_absent_from_the_project_warns_instead_of_dangling(window, monkeypatch):
+    window.service.set_project(_project_with_two_clips())
+    window.refresh()
+    window.select_clip_by_id(window.service.video_track.clips[0].id)
+    window.copy_selected_clip()
+
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **_kw: warned.append(args[1]))
+    window.new_project()
+    window.paste_clip()
+
+    assert warned == ["Paste failed"]
+    assert not window.service.video_track.clips

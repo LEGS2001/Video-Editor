@@ -323,3 +323,39 @@ def test_service_text_edits_are_undoable():
 
     assert service.remove_text(service.texts[0].id)
     assert service.texts == []
+
+
+def test_paste_lands_after_the_anchor_and_is_undoable():
+    asset = MediaAsset(id="asset", path="/tmp/a.mp4", duration_ms=4000, has_video=True)
+    project = Project(media=[asset])
+    project.timeline.tracks[0].clips = [
+        Clip(id="a", asset_id="asset", source_out_ms=1000),
+        Clip(id="b", asset_id="asset", source_in_ms=1000, source_out_ms=2000, timeline_start_ms=1000),
+    ]
+    service = ProjectService(project)
+
+    # A copy of the first clip pasted after the second must stay after it:
+    # normalize_timeline sorts on timeline_start_ms before repacking.
+    copy = service.insert_clip_copy(service.clip_by_id("a"), "b")
+
+    assert [clip.id for clip in service.video_track.clips] == ["a", "b", copy.id]
+    assert copy.id != "a"
+    assert service.clip_by_id(copy.id) is not None
+    assert service.undo()
+    assert [clip.id for clip in service.video_track.clips] == ["a", "b"]
+
+
+def test_duplicate_inserts_the_copy_directly_after_its_original():
+    asset = MediaAsset(id="asset", path="/tmp/a.mp4", duration_ms=4000, has_video=True)
+    project = Project(media=[asset])
+    project.timeline.tracks[0].clips = [
+        Clip(id="a", asset_id="asset", source_out_ms=1000),
+        Clip(id="b", asset_id="asset", source_in_ms=1000, source_out_ms=2000, timeline_start_ms=1000),
+    ]
+    service = ProjectService(project)
+
+    copy = service.duplicate_clip("a")
+
+    assert [clip.id for clip in service.video_track.clips] == ["a", copy.id, "b"]
+    assert copy.source_in_ms == 0 and copy.source_out_ms == 1000
+    assert service.duplicate_clip("missing") is None
