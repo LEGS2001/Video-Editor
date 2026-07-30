@@ -864,3 +864,20 @@ def test_recent_projects_keeps_most_recent_first_and_caps_the_list(window, tmp_p
         assert len(recent) == len(set(recent))
     finally:
         window.settings.setValue("project/recent", previous)
+
+
+def test_shortcut_sheet_is_derived_from_the_real_bindings(window, monkeypatch):
+    captured = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **_kw: captured.append(args[2]))
+
+    window.show_shortcuts()
+
+    listing = captured[0]
+    # Read off the actions, so anything given a shortcut shows up without an edit here.
+    assert "Ctrl+S" in listing and "Save" in listing
+    assert "Ctrl+D" in listing and "Duplicate Clip" in listing
+    assert "F1" in listing
+    # Raw eventFilter keys have no QAction and are listed explicitly.
+    assert "Space" in listing and "Toggle timeline snapping" in listing
+    # An action without a shortcut is not listed.
+    assert "Relink Missing from Folder" not in listing

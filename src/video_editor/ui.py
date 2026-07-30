@@ -1183,6 +1183,8 @@ class MainWindow(QMainWindow):
         self.next_clip_action = QAction("Select Next Clip", self)
         self.move_clip_left_action = QAction("Move Clip Left", self)
         self.move_clip_right_action = QAction("Move Clip Right", self)
+        self.help_action = QAction("Keyboard Shortcuts", self)
+        self.help_action.setToolTip("List every keyboard shortcut")
         self.duplicate_action = QAction("Duplicate Clip", self)
         self.duplicate_action.setToolTip("Insert a copy of the selected clip right after it")
         self.copy_action = QAction("Copy Clip", self)
@@ -1202,6 +1204,7 @@ class MainWindow(QMainWindow):
         self.next_clip_action.setShortcut("Alt+Down")
         self.move_clip_left_action.setShortcut("Alt+Left")
         self.move_clip_right_action.setShortcut("Alt+Right")
+        self.help_action.setShortcut("F1")
         self.duplicate_action.setShortcut("Ctrl+D")
         self.copy_action.setShortcut("Ctrl+C")
         self.paste_action.setShortcut("Ctrl+V")
@@ -1222,6 +1225,7 @@ class MainWindow(QMainWindow):
         self.next_clip_action.triggered.connect(lambda: self.select_relative_clip(1))
         self.move_clip_left_action.triggered.connect(lambda: self.move_selected_clip(-1))
         self.move_clip_right_action.triggered.connect(lambda: self.move_selected_clip(1))
+        self.help_action.triggered.connect(self.show_shortcuts)
         self.duplicate_action.triggered.connect(self.duplicate_selected_clip)
         self.copy_action.triggered.connect(self.copy_selected_clip)
         self.paste_action.triggered.connect(self.paste_clip)
@@ -1262,6 +1266,8 @@ class MainWindow(QMainWindow):
         media_menu.addAction(self.import_action)
         media_menu.addAction(self.relink_action)
         media_menu.addAction(self.relink_folder_action)
+
+        self.menuBar().addMenu("Help").addAction(self.help_action)
 
         # Export-format toggle, pushed to the top-right corner.
         spacer = QWidget()
@@ -2268,6 +2274,27 @@ class MainWindow(QMainWindow):
         self._remember_recent(target)
         self.statusBar().showMessage(f"Saved {target}")
         return True
+
+    # Handled raw in eventFilter, so they have no QAction to read a shortcut off.
+    RAW_KEY_SHORTCUTS = (
+        ("Space", "Play / pause"),
+        (", / .", "Previous / next frame"),
+        ("Home / End", "Jump to start / end"),
+        ("N", "Toggle timeline snapping"),
+    )
+
+    def show_shortcuts(self) -> None:
+        """Derived from the actions themselves, so the list cannot drift."""
+        rows = [
+            (action.shortcut().toString(), action.text())
+            for action in self.findChildren(QAction)
+            if action.shortcut().toString()
+        ]
+        rows.extend(self.RAW_KEY_SHORTCUTS)
+        body = "".join(
+            f"<tr><td><b>{key}</b>&nbsp;&nbsp;</td><td>{label}</td></tr>" for key, label in rows
+        )
+        QMessageBox.information(self, "Keyboard Shortcuts", f"<table>{body}</table>")
 
     def _recent_projects(self) -> list[str]:
         # Newline-joined rather than a QStringList: a one-element list does not
